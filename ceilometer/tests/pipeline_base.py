@@ -18,10 +18,12 @@
 # under the License.
 
 import abc
+import copy
 import datetime
 import traceback
 
 import mock
+from oslo_context import context
 from oslo_utils import timeutils
 from oslotest import base
 from oslotest import mockpatch
@@ -61,6 +63,7 @@ class BasePipelineTestCase(base.BaseTestCase):
             'unit_conversion': conversions.ScalingTransformer,
             'rate_of_change': conversions.RateOfChangeTransformer,
             'arithmetic': arithmetic.ArithmeticTransformer,
+            'delta': conversions.DeltaTransformer,
         }
 
         if name in class_name_ext:
@@ -86,6 +89,7 @@ class BasePipelineTestCase(base.BaseTestCase):
 
     class TransformerClass(transformer.TransformerBase):
         samples = []
+        grouping_keys = ['counter_name']
 
         def __init__(self, append_name='_update'):
             self.__class__.samples = []
@@ -111,6 +115,7 @@ class BasePipelineTestCase(base.BaseTestCase):
 
     class TransformerClassDrop(transformer.TransformerBase):
         samples = []
+        grouping_keys = ['resource_id']
 
         def __init__(self):
             self.__class__.samples = []
@@ -119,6 +124,8 @@ class BasePipelineTestCase(base.BaseTestCase):
             self.__class__.samples.append(counter)
 
     class TransformerClassException(object):
+        grouping_keys = ['resource_id']
+
         @staticmethod
         def handle_sample(ctxt, counter):
             raise Exception()
@@ -302,6 +309,72 @@ class BasePipelineTestCase(base.BaseTestCase):
         self.assertEqual(2, len(self.TransformerClass.samples))
         self.assertEqual('a_update', getattr(publisher.samples[0], "name"))
         self.assertEqual('b_update', getattr(publisher.samples[1], "name"))
+
+    @mock.patch('ceilometer.pipeline.LOG')
+    def test_none_volume_counter(self, LOG):
+        self._set_pipeline_cfg('counters', ['empty_volume'])
+        pipeline_manager = pipeline.PipelineManager(self.pipeline_cfg,
+                                                    self.transformer_manager)
+        publisher = pipeline_manager.pipelines[0].publishers[0]
+
+        test_s = sample.Sample(
+            name='empty_volume',
+            type=self.test_counter.type,
+            volume=None,
+            unit=self.test_counter.unit,
+            user_id=self.test_counter.user_id,
+            project_id=self.test_counter.project_id,
+            resource_id=self.test_counter.resource_id,
+            timestamp=self.test_counter.timestamp,
+            resource_metadata=self.test_counter.resource_metadata,
+        )
+
+        with pipeline_manager.publisher(None) as p:
+            p([test_s])
+
+        LOG.warning.assert_called_once_with(
+            'metering data %(counter_name)s for %(resource_id)s '
+            '@ %(timestamp)s has no volume (volume: %(counter_volume)s), the '
+            'sample will be dropped'
+            % {'counter_name': test_s.name,
+               'resource_id': test_s.resource_id,
+               'timestamp': test_s.timestamp,
+               'counter_volume': test_s.volume})
+
+        self.assertEqual(0, len(publisher.samples))
+
+    @mock.patch('ceilometer.pipeline.LOG')
+    def test_fake_volume_counter(self, LOG):
+        self._set_pipeline_cfg('counters', ['fake_volume'])
+        pipeline_manager = pipeline.PipelineManager(self.pipeline_cfg,
+                                                    self.transformer_manager)
+        publisher = pipeline_manager.pipelines[0].publishers[0]
+
+        test_s = sample.Sample(
+            name='fake_volume',
+            type=self.test_counter.type,
+            volume='fake_value',
+            unit=self.test_counter.unit,
+            user_id=self.test_counter.user_id,
+            project_id=self.test_counter.project_id,
+            resource_id=self.test_counter.resource_id,
+            timestamp=self.test_counter.timestamp,
+            resource_metadata=self.test_counter.resource_metadata,
+        )
+
+        with pipeline_manager.publisher(None) as p:
+            p([test_s])
+
+        LOG.warning.assert_called_once_with(
+            'metering data %(counter_name)s for %(resource_id)s '
+            '@ %(timestamp)s has volume which is not a number '
+            '(volume: %(counter_volume)s), the sample will be dropped'
+            % {'counter_name': test_s.name,
+               'resource_id': test_s.resource_id,
+               'timestamp': test_s.timestamp,
+               'counter_volume': test_s.volume})
+
+        self.assertEqual(0, len(publisher.samples))
 
     def test_counter_dont_match(self):
         counter_cfg = ['nomatch']
@@ -749,39 +822,6 @@ class BasePipelineTestCase(base.BaseTestCase):
         self.assertEqual('a_update',
                          getattr(publisher.samples[0], 'name'))
 
-    def test_variable_counter(self):
-        transformer_cfg = [{
-            'name': "update",
-            'parameters': {}
-        }]
-        self._set_pipeline_cfg('transformers', transformer_cfg)
-        self._set_pipeline_cfg('counters', ['a:*'])
-        pipeline_manager = pipeline.PipelineManager(self.pipeline_cfg,
-                                                    self.transformer_manager)
-
-        self.test_counter = sample.Sample(
-            name='a:b',
-            type=self.test_counter.type,
-            volume=self.test_counter.volume,
-            unit=self.test_counter.unit,
-            user_id=self.test_counter.user_id,
-            project_id=self.test_counter.project_id,
-            resource_id=self.test_counter.resource_id,
-            timestamp=self.test_counter.timestamp,
-            resource_metadata=self.test_counter.resource_metadata,
-        )
-
-        with pipeline_manager.publisher(None) as p:
-            p([self.test_counter])
-
-        publisher = pipeline_manager.pipelines[0].publishers[0]
-        self.assertEqual(1, len(publisher.samples))
-        self.assertEqual(1, len(self.TransformerClass.samples))
-        self.assertEqual('a:b_update',
-                         getattr(publisher.samples[0], "name"))
-        self.assertEqual('a:b',
-                         getattr(self.TransformerClass.samples[0], "name"))
-
     def test_global_unit_conversion(self):
         scale = 'volume / ((10**6) * 60)'
         transformer_cfg = [
@@ -1010,7 +1050,7 @@ class BasePipelineTestCase(base.BaseTestCase):
                                                 offset=0)
 
     def test_rate_of_change_no_predecessor(self):
-        s = "100.0 / (10**9 * resource_metadata.get('cpu_number', 1))"
+        s = "100.0 / (10**9 * (resource_metadata.cpu_number or 1))"
         transformer_cfg = [
             {
                 'name': 'rate_of_change',
@@ -1049,6 +1089,80 @@ class BasePipelineTestCase(base.BaseTestCase):
         self.assertEqual(0, len(publisher.samples))
         pipe.flush(None)
         self.assertEqual(0, len(publisher.samples))
+
+    @mock.patch('ceilometer.transformer.conversions.LOG')
+    def test_rate_of_change_out_of_order(self, the_log):
+        s = "100.0 / (10**9 * (resource_metadata.cpu_number or 1))"
+        transformer_cfg = [
+            {
+                'name': 'rate_of_change',
+                'parameters': {
+                    'source': {},
+                    'target': {'name': 'cpu_util',
+                               'unit': '%',
+                               'type': sample.TYPE_GAUGE,
+                               'scale': s}
+                }
+            },
+        ]
+        self._set_pipeline_cfg('transformers', transformer_cfg)
+        self._set_pipeline_cfg('counters', ['cpu'])
+        pipeline_manager = pipeline.PipelineManager(self.pipeline_cfg,
+                                                    self.transformer_manager)
+        pipe = pipeline_manager.pipelines[0]
+
+        now = timeutils.utcnow()
+        earlier = now - datetime.timedelta(seconds=10)
+        later = now + datetime.timedelta(seconds=10)
+
+        counters = [
+            sample.Sample(
+                name='cpu',
+                type=sample.TYPE_CUMULATIVE,
+                volume=125000000000,
+                unit='ns',
+                user_id='test_user',
+                project_id='test_proj',
+                resource_id='test_resource',
+                timestamp=now.isoformat(),
+                resource_metadata={'cpu_number': 4}
+            ),
+            sample.Sample(
+                name='cpu',
+                type=sample.TYPE_CUMULATIVE,
+                volume=120000000000,
+                unit='ns',
+                user_id='test_user',
+                project_id='test_proj',
+                resource_id='test_resource',
+                timestamp=earlier.isoformat(),
+                resource_metadata={'cpu_number': 4}
+            ),
+            sample.Sample(
+                name='cpu',
+                type=sample.TYPE_CUMULATIVE,
+                volume=130000000000,
+                unit='ns',
+                user_id='test_user',
+                project_id='test_proj',
+                resource_id='test_resource',
+                timestamp=later.isoformat(),
+                resource_metadata={'cpu_number': 4}
+            ),
+        ]
+
+        pipe.publish_data(None, counters)
+        publisher = pipe.publishers[0]
+        self.assertEqual(1, len(publisher.samples))
+        pipe.flush(None)
+        self.assertEqual(1, len(publisher.samples))
+
+        cpu_util_sample = publisher.samples[0]
+        self.assertEqual(12.5, cpu_util_sample.volume)
+        the_log.warning.assert_called_with(
+            'dropping out of time order sample: %s',
+            (counters[1],)
+        )
 
     def test_resources(self):
         resources = ['test1://', 'test2://']
@@ -1258,15 +1372,6 @@ class BasePipelineTestCase(base.BaseTestCase):
         actual = sorted(s.volume for s in publisher.samples)
         self.assertEqual([2.0, 3.0, 6.0], actual)
 
-    def test_aggregator_input_validation(self):
-        aggregator = conversions.AggregatorTransformer("1", "15", None,
-                                                       None, None)
-        self.assertEqual(1, aggregator.size)
-        self.assertEqual(15, aggregator.retention_time)
-
-        self.assertRaises(ValueError, conversions.AggregatorTransformer,
-                          "abc", "cde", None, None, None)
-
     def test_aggregator_metadata(self):
         for conf, expected_version in [('last', '2.0'), ('first', '1.0')]:
             samples = self._do_test_aggregator({
@@ -1411,7 +1516,7 @@ class BasePipelineTestCase(base.BaseTestCase):
             'target': {'name': 'aggregated-bytes'}
         }, expected_length=1)
         s = samples[0]
-        self.assertTrue(mylog.warn.called)
+        self.assertTrue(mylog.warning.called)
         self.assertEqual('aggregated-bytes', s.name)
         self.assertEqual(154, s.volume)
         self.assertEqual('test_user_bis', s.user_id)
@@ -1557,6 +1662,65 @@ class BasePipelineTestCase(base.BaseTestCase):
         self.assertEqual("test_resource", getattr(publisher.samples[0],
                                                   'resource_id'))
 
+    def test_aggregator_to_rate_of_change_transformer_two_resources(self):
+        resource_id = ['1ca738a1-c49c-4401-8346-5c60ebdb03f4',
+                       '5dd418a6-c6a9-49c9-9cef-b357d72c71dd']
+
+        aggregator = conversions.AggregatorTransformer(size="2",
+                                                       timestamp="last")
+
+        rate_of_change_transformer = conversions.RateOfChangeTransformer()
+
+        counter_time = timeutils.parse_isotime('2016-01-01T12:00:00+00:00')
+
+        for offset in range(2):
+            counter = copy.copy(self.test_counter)
+            counter.timestamp = timeutils.isotime(counter_time)
+            counter.resource_id = resource_id[0]
+            counter.volume = offset
+            counter.type = sample.TYPE_CUMULATIVE
+            counter.unit = 'ns'
+            aggregator.handle_sample(context.get_admin_context(), counter)
+
+            if offset == 1:
+                test_time = counter_time
+
+            counter_time = counter_time + datetime.timedelta(0, 1)
+
+        aggregated_counters = aggregator.flush(context.get_admin_context())
+        self.assertEqual(len(aggregated_counters), 1)
+        self.assertEqual(aggregated_counters[0].timestamp,
+                         timeutils.isotime(test_time))
+
+        rate_of_change_transformer.handle_sample(context.get_admin_context(),
+                                                 aggregated_counters[0])
+
+        for offset in range(2):
+            counter = copy.copy(self.test_counter)
+            counter.timestamp = timeutils.isotime(counter_time)
+            counter.resource_id = resource_id[offset]
+            counter.volume = 2
+            counter.type = sample.TYPE_CUMULATIVE
+            counter.unit = 'ns'
+            aggregator.handle_sample(context.get_admin_context(), counter)
+
+            if offset == 0:
+                test_time = counter_time
+
+            counter_time = counter_time + datetime.timedelta(0, 1)
+
+        aggregated_counters = aggregator.flush(context.get_admin_context())
+        self.assertEqual(len(aggregated_counters), 2)
+
+        for counter in aggregated_counters:
+            if counter.resource_id == resource_id[0]:
+                rateOfChange = rate_of_change_transformer.handle_sample(
+                    context.get_admin_context(), counter)
+                self.assertEqual(counter.timestamp,
+                                 timeutils.isotime(test_time))
+
+        self.assertEqual(rateOfChange.volume, 1)
+
     def _do_test_arithmetic_expr_parse(self, expr, expected):
         actual = arithmetic.ArithmeticTransformer.parse_expr(expr)
         self.assertEqual(expected, actual)
@@ -1631,12 +1795,11 @@ class BasePipelineTestCase(base.BaseTestCase):
         pipeline_manager = pipeline.PipelineManager(self.pipeline_cfg,
                                                     self.transformer_manager)
         pipe = pipeline_manager.pipelines[0]
-
-        pipe.publish_data(None, counters)
+        for s in counters:
+            pipe.publish_data(None, s)
+            pipe.flush(None)
         publisher = pipeline_manager.pipelines[0].publishers[0]
         expected_len = len(test_resources) * len(expected)
-        self.assertEqual(0, len(publisher.samples))
-        pipe.flush(None)
         self.assertEqual(expected_len, len(publisher.samples))
 
         # bucket samples by resource first
@@ -1706,7 +1869,7 @@ class BasePipelineTestCase(base.BaseTestCase):
             dict(name='memory.usage', volume=512.0),
             dict(name='memory', volume=1024.0),
         ]
-        expected = [50.0]
+        expected = [25.0]
         self._do_test_arithmetic(expression, scenario, expected)
 
     def test_arithmetic_transformer_missing(self):
@@ -1787,6 +1950,209 @@ class BasePipelineTestCase(base.BaseTestCase):
         publisher = pipeline_manager.pipelines[0].publishers[0]
         self.assertEqual(0, len(publisher.samples))
 
+    def _do_test_delta(self, data, expected, growth_only=False):
+        transformer_cfg = [
+            {
+                'name': 'delta',
+                'parameters': {
+                    'target': {'name': 'new_meter'},
+                    'growth_only': growth_only,
+                }
+            },
+        ]
+        self._set_pipeline_cfg('transformers', transformer_cfg)
+        self._set_pipeline_cfg('counters', ['cpu'])
+
+        pipeline_manager = pipeline.PipelineManager(self.pipeline_cfg,
+                                                    self.transformer_manager)
+        pipe = pipeline_manager.pipelines[0]
+
+        pipe.publish_data(None, data)
+        pipe.flush(None)
+        publisher = pipeline_manager.pipelines[0].publishers[0]
+        self.assertEqual(expected, len(publisher.samples))
+        return publisher.samples
+
+    def test_delta_transformer(self):
+        samples = [
+            sample.Sample(
+                name='cpu',
+                type=sample.TYPE_CUMULATIVE,
+                volume=26,
+                unit='ns',
+                user_id='test_user',
+                project_id='test_proj',
+                resource_id='test_resource',
+                timestamp=timeutils.utcnow().isoformat(),
+                resource_metadata={'version': '1.0'}
+            ),
+            sample.Sample(
+                name='cpu',
+                type=sample.TYPE_CUMULATIVE,
+                volume=16,
+                unit='ns',
+                user_id='test_user',
+                project_id='test_proj',
+                resource_id='test_resource',
+                timestamp=timeutils.utcnow().isoformat(),
+                resource_metadata={'version': '2.0'}
+            ),
+            sample.Sample(
+                name='cpu',
+                type=sample.TYPE_CUMULATIVE,
+                volume=53,
+                unit='ns',
+                user_id='test_user_bis',
+                project_id='test_proj_bis',
+                resource_id='test_resource',
+                timestamp=timeutils.utcnow().isoformat(),
+                resource_metadata={'version': '1.0'}
+            ),
+        ]
+        deltas = self._do_test_delta(samples, 2)
+        self.assertEqual('new_meter', deltas[0].name)
+        self.assertEqual('delta', deltas[0].type)
+        self.assertEqual('ns', deltas[0].unit)
+        self.assertEqual({'version': '2.0'}, deltas[0].resource_metadata)
+        self.assertEqual(-10, deltas[0].volume)
+        self.assertEqual('new_meter', deltas[1].name)
+        self.assertEqual('delta', deltas[1].type)
+        self.assertEqual('ns', deltas[1].unit)
+        self.assertEqual({'version': '1.0'}, deltas[1].resource_metadata)
+        self.assertEqual(37, deltas[1].volume)
+
+    def test_delta_transformer_out_of_order(self):
+        samples = [
+            sample.Sample(
+                name='cpu',
+                type=sample.TYPE_CUMULATIVE,
+                volume=26,
+                unit='ns',
+                user_id='test_user',
+                project_id='test_proj',
+                resource_id='test_resource',
+                timestamp=timeutils.utcnow().isoformat(),
+                resource_metadata={'version': '1.0'}
+            ),
+            sample.Sample(
+                name='cpu',
+                type=sample.TYPE_CUMULATIVE,
+                volume=16,
+                unit='ns',
+                user_id='test_user',
+                project_id='test_proj',
+                resource_id='test_resource',
+                timestamp=((timeutils.utcnow() - datetime.timedelta(minutes=5))
+                           .isoformat()),
+                resource_metadata={'version': '2.0'}
+            ),
+            sample.Sample(
+                name='cpu',
+                type=sample.TYPE_CUMULATIVE,
+                volume=53,
+                unit='ns',
+                user_id='test_user_bis',
+                project_id='test_proj_bis',
+                resource_id='test_resource',
+                timestamp=timeutils.utcnow().isoformat(),
+                resource_metadata={'version': '1.0'}
+            ),
+        ]
+        deltas = self._do_test_delta(samples, 1)
+        self.assertEqual('new_meter', deltas[0].name)
+        self.assertEqual('delta', deltas[0].type)
+        self.assertEqual('ns', deltas[0].unit)
+        self.assertEqual({'version': '1.0'}, deltas[0].resource_metadata)
+        self.assertEqual(27, deltas[0].volume)
+
+    def test_delta_transformer_growth_only(self):
+        samples = [
+            sample.Sample(
+                name='cpu',
+                type=sample.TYPE_CUMULATIVE,
+                volume=26,
+                unit='ns',
+                user_id='test_user',
+                project_id='test_proj',
+                resource_id='test_resource',
+                timestamp=timeutils.utcnow().isoformat(),
+                resource_metadata={'version': '1.0'}
+            ),
+            sample.Sample(
+                name='cpu',
+                type=sample.TYPE_CUMULATIVE,
+                volume=16,
+                unit='ns',
+                user_id='test_user',
+                project_id='test_proj',
+                resource_id='test_resource',
+                timestamp=timeutils.utcnow().isoformat(),
+                resource_metadata={'version': '2.0'}
+            ),
+            sample.Sample(
+                name='cpu',
+                type=sample.TYPE_CUMULATIVE,
+                volume=53,
+                unit='ns',
+                user_id='test_user_bis',
+                project_id='test_proj_bis',
+                resource_id='test_resource',
+                timestamp=timeutils.utcnow().isoformat(),
+                resource_metadata={'version': '1.0'}
+            ),
+        ]
+        deltas = self._do_test_delta(samples, 1, True)
+        self.assertEqual('new_meter', deltas[0].name)
+        self.assertEqual('delta', deltas[0].type)
+        self.assertEqual('ns', deltas[0].unit)
+        self.assertEqual({'version': '1.0'}, deltas[0].resource_metadata)
+        self.assertEqual(37, deltas[0].volume)
+
     def test_unique_pipeline_names(self):
         self._dup_pipeline_name_cfg()
         self._exception_create_pipelinemanager()
+
+    def test_get_pipeline_grouping_key(self):
+        transformer_cfg = [
+            {
+                'name': 'update',
+                'parameters': {}
+            },
+            {
+                'name': 'unit_conversion',
+                'parameters': {
+                    'source': {},
+                    'target': {'name': 'cpu_mins',
+                               'unit': 'min',
+                               'scale': 'volume'},
+                }
+            },
+            {
+                'name': 'update',
+                'parameters': {}
+            },
+        ]
+        self._set_pipeline_cfg('transformers', transformer_cfg)
+        pipeline_manager = pipeline.PipelineManager(self.pipeline_cfg,
+                                                    self.transformer_manager)
+        self.assertEqual(set(['resource_id', 'counter_name']),
+                         set(pipeline.get_pipeline_grouping_key(
+                             pipeline_manager.pipelines[0])))
+
+    def test_get_pipeline_duplicate_grouping_key(self):
+        transformer_cfg = [
+            {
+                'name': 'update',
+                'parameters': {}
+            },
+            {
+                'name': 'update',
+                'parameters': {}
+            },
+        ]
+        self._set_pipeline_cfg('transformers', transformer_cfg)
+        pipeline_manager = pipeline.PipelineManager(self.pipeline_cfg,
+                                                    self.transformer_manager)
+        self.assertEqual(['counter_name'],
+                         pipeline.get_pipeline_grouping_key(
+                             pipeline_manager.pipelines[0]))

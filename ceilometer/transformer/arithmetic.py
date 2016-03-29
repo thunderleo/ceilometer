@@ -35,6 +35,8 @@ class ArithmeticTransformer(transformer.TransformerBase):
     over one or more meters and/or their metadata.
     """
 
+    grouping_keys = ['resource_id']
+
     meter_name_re = re.compile(r'\$\(([\w\.\-]+)\)')
 
     def __init__(self, target=None, **kwargs):
@@ -52,8 +54,8 @@ class ArithmeticTransformer(transformer.TransformerBase):
             self.cache = collections.defaultdict(dict)
             self.latest_timestamp = None
         else:
-            LOG.warn(_('Arithmetic transformer must use at least one'
-                       ' meter in expression \'%s\''), self.expr)
+            LOG.warning(_('Arithmetic transformer must use at least one'
+                        ' meter in expression \'%s\''), self.expr)
 
     def _update_cache(self, _sample):
         """Update the cache with the latest sample."""
@@ -90,8 +92,8 @@ class ArithmeticTransformer(transformer.TransformerBase):
                 resource_metadata=reference_sample.resource_metadata
             )
         except Exception as e:
-            LOG.warn(_('Unable to evaluate expression %(expr)s: %(exc)s'),
-                     {'expr': self.expr, 'exc': e})
+            LOG.warning(_('Unable to evaluate expression %(expr)s: %(exc)s'),
+                        {'expr': self.expr, 'exc': e})
 
     def handle_sample(self, context, _sample):
         self._update_cache(_sample)
@@ -99,15 +101,14 @@ class ArithmeticTransformer(transformer.TransformerBase):
 
     def flush(self, context):
         new_samples = []
+        cache_clean_list = []
         if not self.misconfigured:
             for resource_id in self.cache:
                 if self._check_requirements(resource_id):
                     new_samples.append(self._calculate(resource_id))
-                else:
-                    LOG.warn(_('Unable to perform calculation, not all of '
-                               '{%s} are present'),
-                             ', '.join(self.required_meters))
-            self.cache.clear()
+                    cache_clean_list.append(resource_id)
+            for res_id in cache_clean_list:
+                self.cache.pop(res_id)
         return new_samples
 
     @classmethod

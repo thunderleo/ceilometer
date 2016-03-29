@@ -18,7 +18,6 @@ from oslo_log import log
 from oslo_utils import netutils
 from six.moves.urllib import parse as urlparse
 
-from ceilometer.i18n import _
 from ceilometer.storage.hbase import inmemory as hbase_inmemory
 
 LOG = log.getLogger(__name__)
@@ -42,8 +41,8 @@ class Connection(object):
             else:
                 # This is a in-memory usage for unit tests
                 if Connection._memory_instance is None:
-                    LOG.debug(_('Creating a new in-memory HBase '
-                              'Connection object'))
+                    LOG.debug('Creating a new in-memory HBase '
+                              'Connection object')
                     Connection._memory_instance = (hbase_inmemory.
                                                    MConnectionPool())
                 self.conn_pool = Connection._memory_instance
@@ -59,11 +58,12 @@ class Connection(object):
           The tests use a subclass to override this and return an
           in-memory connection pool.
         """
-        LOG.debug(_('connecting to HBase on %(host)s:%(port)s') % (
-                  {'host': conf['host'], 'port': conf['port']}))
-        return happybase.ConnectionPool(size=100, host=conf['host'],
-                                        port=conf['port'],
-                                        table_prefix=conf['table_prefix'])
+        LOG.debug('connecting to HBase on %(host)s:%(port)s',
+                  {'host': conf['host'], 'port': conf['port']})
+        return happybase.ConnectionPool(
+            size=100, host=conf['host'], port=conf['port'],
+            table_prefix=conf['table_prefix'],
+            table_prefix_separator=conf['table_prefix_separator'])
 
     @staticmethod
     def _parse_connection_url(url):
@@ -78,6 +78,8 @@ class Connection(object):
         result = netutils.urlsplit(url)
         opts['table_prefix'] = urlparse.parse_qs(
             result.query).get('table_prefix', [None])[0]
+        opts['table_prefix_separator'] = urlparse.parse_qs(
+            result.query).get('table_prefix_separator', ['_'])[0]
         opts['dbtype'] = result.scheme
         if ':' in result.netloc:
             opts['host'], port = result.netloc.split(':')

@@ -11,19 +11,21 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-import fnmatch
-import os
+import itertools
+import pkg_resources
 import six
-import yaml
 
-import jsonpath_rw
+from debtcollector import moves
 from oslo_config import cfg
 from oslo_log import log
 import oslo_messaging
+from stevedore import extension
 
 from ceilometer.agent import plugin_base
-from ceilometer.i18n import _LE
+from ceilometer import declarative
+from ceilometer.i18n import _LE, _LW
 from ceilometer import sample
+from ceilometer import utils
 
 OPTS = [
     cfg.StrOpt('meter_definitions_cfg_file',
@@ -33,118 +35,171 @@ OPTS = [
 ]
 
 cfg.CONF.register_opts(OPTS, group='meter')
+cfg.CONF.import_opt('disable_non_metric_meters', 'ceilometer.notification',
+                    group='notification')
 
 LOG = log.getLogger(__name__)
 
 
-class MeterDefinitionException(Exception):
-    def __init__(self, message, definition_cfg):
-        super(MeterDefinitionException, self).__init__(message)
-        self.definition_cfg = definition_cfg
-
-    def __str__(self):
-        return '%s %s: %s' % (self.__class__.__name__,
-                              self.definition_cfg, self.message)
+MeterDefinitionException = moves.moved_class(declarative.DefinitionException,
+                                             'MeterDefinitionException',
+                                             __name__,
+                                             version=6.0,
+                                             removal_version="?")
 
 
 class MeterDefinition(object):
 
-    def __init__(self, definition_cfg):
+    SAMPLE_ATTRIBUTES = ["name", "type", "volume", "unit", "timestamp",
+                         "user_id", "project_id", "resource_id"]
+
+    REQUIRED_FIELDS = ['name', 'type', 'event_type', 'unit', 'volume',
+                       'resource_id']
+
+    def __init__(self, definition_cfg, plugin_manager):
         self.cfg = definition_cfg
-        self._validate_type()
+        missing = [field for field in self.REQUIRED_FIELDS
+                   if not self.cfg.get(field)]
+        if missing:
+            raise declarative.DefinitionException(
+                _LE("Required fields %s not specified") % missing, self.cfg)
 
-    def match_type(self, meter_name):
-        try:
-            event_type = self.cfg['event_type']
-        except KeyError as err:
-            raise MeterDefinitionException(
-                _LE("Required field %s not specified") % err.args[0], self.cfg)
+        self._event_type = self.cfg.get('event_type')
+        if isinstance(self._event_type, six.string_types):
+            self._event_type = [self._event_type]
 
-        if isinstance(event_type, six.string_types):
-            event_type = [event_type]
-        for t in event_type:
-            if fnmatch.fnmatch(meter_name, t):
-                return True
-
-    def parse_fields(self, field, message):
-        fval = self.cfg.get(field)
-        if not fval:
-            return
-        if isinstance(fval, six.integer_types):
-            return fval
-        try:
-            parts = jsonpath_rw.parse(fval)
-        except Exception as e:
-            raise MeterDefinitionException(
-                _LE("Parse error in JSONPath specification "
-                    "'%(jsonpath)s': %(err)s")
-                % dict(jsonpath=parts, err=e), self.cfg)
-        values = [match.value for match in parts.find(message)
-                  if match.value is not None]
-        if values:
-            return values[0]
-
-    def _validate_type(self):
-        if self.cfg['type'] not in sample.TYPES:
-            raise MeterDefinitionException(
+        if ('type' not in self.cfg.get('lookup', []) and
+                self.cfg['type'] not in sample.TYPES):
+            raise declarative.DefinitionException(
                 _LE("Invalid type %s specified") % self.cfg['type'], self.cfg)
 
+        self._fallback_user_id = declarative.Definition(
+            'user_id', "_context_user_id|_context_user", plugin_manager)
+        self._fallback_project_id = declarative.Definition(
+            'project_id', "_context_tenant_id|_context_tenant", plugin_manager)
+        self._attributes = {}
+        self._metadata_attributes = {}
 
-def get_config_file():
-    config_file = cfg.CONF.meter.meter_definitions_cfg_file
-    if not os.path.exists(config_file):
-        config_file = cfg.CONF.find_file(config_file)
-    return config_file
+        for name in self.SAMPLE_ATTRIBUTES:
+            attr_cfg = self.cfg.get(name)
+            if attr_cfg:
+                self._attributes[name] = declarative.Definition(
+                    name, attr_cfg, plugin_manager)
+        metadata = self.cfg.get('metadata', {})
+        for name in metadata:
+            self._metadata_attributes[name] = declarative.Definition(
+                name, metadata[name], plugin_manager)
 
+        # List of fields we expected when multiple meter are in the payload
+        self.lookup = self.cfg.get('lookup')
+        if isinstance(self.lookup, six.string_types):
+            self.lookup = [self.lookup]
 
-def setup_meters_config():
-    """Setup the meters definitions from yaml config file."""
-    config_file = get_config_file()
-    if config_file is not None:
-        LOG.debug(_LE("Meter Definitions configuration file: %s"), config_file)
+    def match_type(self, meter_name):
+        for t in self._event_type:
+            if utils.match(meter_name, t):
+                return True
 
-        with open(config_file) as cf:
-            config = cf.read()
+    def to_samples(self, message, all_values=False):
+        # Sample defaults
+        sample = {
+            'name': self.cfg["name"], 'type': self.cfg["type"],
+            'unit': self.cfg["unit"], 'volume': None, 'timestamp': None,
+            'user_id': self._fallback_user_id.parse(message),
+            'project_id': self._fallback_project_id.parse(message),
+            'resource_id': None, 'message': message, 'metadata': {},
+        }
+        for name, parser in self._metadata_attributes.items():
+            value = parser.parse(message)
+            if value:
+                sample['metadata'][name] = value
 
-        try:
-            meters_config = yaml.safe_load(config)
-        except yaml.YAMLError as err:
-            if hasattr(err, 'problem_mark'):
-                mark = err.problem_mark
-                errmsg = (_LE("Invalid YAML syntax in Meter Definitions file "
-                          "%(file)s at line: %(line)s, column: %(column)s.")
-                          % dict(file=config_file,
-                                 line=mark.line + 1,
-                                 column=mark.column + 1))
-            else:
-                errmsg = (_LE("YAML error reading Meter Definitions file "
-                          "%(file)s")
-                          % dict(file=config_file))
-            LOG.error(errmsg)
-            raise
+        # NOTE(sileht): We expect multiple samples in the payload
+        # so put each attribute into a list
+        if self.lookup:
+            for name in sample:
+                sample[name] = [sample[name]]
 
-    else:
-        LOG.debug(_LE("No Meter Definitions configuration file found!"
-                  " Using default config."))
-        meters_config = []
+        for name in self.SAMPLE_ATTRIBUTES:
+            parser = self._attributes.get(name)
+            if parser is not None:
+                value = parser.parse(message, bool(self.lookup))
+                # NOTE(sileht): If we expect multiple samples
+                # some attributes are overridden even we don't get any
+                # result. Also note in this case value is always a list
+                if ((not self.lookup and value is not None) or
+                        (self.lookup and ((name in self.lookup + ["name"])
+                                          or value))):
+                    sample[name] = value
 
-    LOG.info(_LE("Meter Definitions: %s"), meters_config)
+        if self.lookup:
+            nb_samples = len(sample['name'])
+            # skip if no meters in payload
+            if nb_samples <= 0:
+                raise StopIteration
 
-    return meters_config
+            attributes = self.SAMPLE_ATTRIBUTES + ["message", "metadata"]
 
+            samples_values = []
+            for name in attributes:
+                values = sample.get(name)
+                nb_values = len(values)
+                if nb_values == nb_samples:
+                    samples_values.append(values)
+                elif nb_values == 1 and name not in self.lookup:
+                    samples_values.append(itertools.cycle(values))
+                else:
+                    nb = (0 if nb_values == 1 and values[0] is None
+                          else nb_values)
+                    LOG.warning('Only %(nb)d fetched meters contain '
+                                '"%(name)s" field instead of %(total)d.' %
+                                dict(name=name, nb=nb,
+                                     total=nb_samples))
+                    raise StopIteration
 
-def load_definitions(config_def):
-    return [MeterDefinition(event_def)
-            for event_def in reversed(config_def['metric'])]
+            # NOTE(sileht): Transform the sample with multiple values per
+            # attribute into multiple samples with one value per attribute.
+            for values in zip(*samples_values):
+                yield dict((attributes[idx], value)
+                           for idx, value in enumerate(values))
+        else:
+            yield sample
 
 
 class ProcessMeterNotifications(plugin_base.NotificationBase):
 
-    event_types = None
+    event_types = []
 
     def __init__(self, manager):
         super(ProcessMeterNotifications, self).__init__(manager)
-        self.definitions = load_definitions(setup_meters_config())
+        self.definitions = self._load_definitions()
+
+    @staticmethod
+    def _load_definitions():
+        plugin_manager = extension.ExtensionManager(
+            namespace='ceilometer.event.trait_plugin')
+        meters_cfg = declarative.load_definitions(
+            {}, cfg.CONF.meter.meter_definitions_cfg_file,
+            pkg_resources.resource_filename(__name__, "data/meters.yaml"))
+
+        definitions = {}
+        for meter_cfg in reversed(meters_cfg['metric']):
+            if meter_cfg.get('name') in definitions:
+                # skip duplicate meters
+                LOG.warning(_LW("Skipping duplicate meter definition %s")
+                            % meter_cfg)
+                continue
+            if (meter_cfg.get('volume') != 1
+                    or not cfg.CONF.notification.disable_non_metric_meters):
+                try:
+                    md = MeterDefinition(meter_cfg, plugin_manager)
+                except declarative.DefinitionException as me:
+                    errmsg = (_LE("Error loading meter definition : %(err)s")
+                              % dict(err=six.text_type(me)))
+                    LOG.error(errmsg)
+                else:
+                    definitions[meter_cfg['name']] = md
+        return definitions.values()
 
     def get_targets(self, conf):
         """Return a sequence of oslo_messaging.Target
@@ -167,38 +222,19 @@ class ProcessMeterNotifications(plugin_base.NotificationBase):
             conf.swift_control_exchange,
             conf.magnetodb_control_exchange,
             conf.ceilometer_control_exchange,
+            conf.magnum_control_exchange,
+            conf.dns_control_exchange,
             ]
 
         for exchange in exchanges:
             targets.extend(oslo_messaging.Target(topic=topic,
                                                  exchange=exchange)
-                           for topic in conf.notification_topics)
+                           for topic in
+                           self.get_notification_topics(conf))
         return targets
 
     def process_notification(self, notification_body):
         for d in self.definitions:
             if d.match_type(notification_body['event_type']):
-                userid = self.get_user_id(d, notification_body)
-                projectid = self.get_project_id(d, notification_body)
-                resourceid = d.parse_fields('resource_id', notification_body)
-                yield sample.Sample.from_notification(
-                    name=d.cfg['name'],
-                    type=d.cfg['type'],
-                    unit=d.cfg['unit'],
-                    volume=d.parse_fields('volume', notification_body),
-                    resource_id=resourceid,
-                    user_id=userid,
-                    project_id=projectid,
-                    message=notification_body)
-
-    @staticmethod
-    def get_user_id(d, notification_body):
-        return (d.parse_fields('user_id', notification_body) or
-                notification_body.get('_context_user_id') or
-                notification_body.get('_context_user', None))
-
-    @staticmethod
-    def get_project_id(d, notification_body):
-        return (d.parse_fields('project_id', notification_body) or
-                notification_body.get('_context_tenant_id') or
-                notification_body.get('_context_tenant', None))
+                for s in d.to_samples(notification_body):
+                    yield sample.Sample.from_notification(**s)

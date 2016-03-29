@@ -25,6 +25,13 @@ _ENFORCER = None
 CONF = cfg.CONF
 
 
+def reset():
+    global _ENFORCER
+    if _ENFORCER:
+        _ENFORCER.clear()
+        _ENFORCER = None
+
+
 def _has_rule(name):
     return name in _ENFORCER.rules.keys()
 
@@ -47,8 +54,8 @@ def enforce(policy_name, request):
 
     policy_dict = dict()
     policy_dict['roles'] = headers.get('X-Roles', "").split(",")
-    policy_dict['target.user_id'] = (headers.get('X-User-Id'))
-    policy_dict['target.project_id'] = (headers.get('X-Project-Id'))
+    policy_dict['user_id'] = (headers.get('X-User-Id'))
+    policy_dict['project_id'] = (headers.get('X-Project-Id'))
 
     # maintain backward compat with Juno and previous by allowing the action if
     # there is no rule defined for it
@@ -75,8 +82,8 @@ def get_limited_to(headers):
 
     policy_dict = dict()
     policy_dict['roles'] = headers.get('X-Roles', "").split(",")
-    policy_dict['target.user_id'] = (headers.get('X-User-Id'))
-    policy_dict['target.project_id'] = (headers.get('X-Project-Id'))
+    policy_dict['user_id'] = (headers.get('X-User-Id'))
+    policy_dict['project_id'] = (headers.get('X-Project-Id'))
 
     # maintain backward compat with Juno and previous by using context_is_admin
     # rule if the segregation rule (added in Kilo) is not defined

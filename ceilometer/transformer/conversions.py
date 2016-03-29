@@ -20,15 +20,17 @@ from oslo_log import log
 from oslo_utils import timeutils
 import six
 
-from ceilometer.i18n import _
+from ceilometer.i18n import _, _LW
 from ceilometer import sample
 from ceilometer import transformer
 
 LOG = log.getLogger(__name__)
 
 
-class ScalingTransformer(transformer.TransformerBase):
-    """Transformer to apply a scaling conversion."""
+class BaseConversionTransformer(transformer.TransformerBase):
+    """Transformer to derive conversion."""
+
+    grouping_keys = ['resource_id']
 
     def __init__(self, source=None, target=None, **kwargs):
         """Initialize transformer with configured parameters.
@@ -42,23 +44,7 @@ class ScalingTransformer(transformer.TransformerBase):
         target = target or {}
         self.source = source
         self.target = target
-        self.scale = target.get('scale')
-        LOG.debug(_('scaling conversion transformer with source:'
-                    ' %(source)s target: %(target)s:')
-                  % {'source': source,
-                     'target': target})
-        super(ScalingTransformer, self).__init__(**kwargs)
-
-    def _scale(self, s):
-        """Apply the scaling factor.
-
-        Either a straight multiplicative factor or else a string to be eval'd.
-        """
-        ns = transformer.Namespace(s.as_dict())
-
-        scale = self.scale
-        return ((eval(scale, {}, ns) if isinstance(scale, six.string_types)
-                 else s.volume * scale) if scale else s.volume)
+        super(BaseConversionTransformer, self).__init__(**kwargs)
 
     def _map(self, s, attr):
         """Apply the name or unit mapping if configured."""
@@ -72,6 +58,92 @@ class ScalingTransformer(transformer.TransformerBase):
                 except Exception:
                     pass
         return mapped or self.target.get(attr, getattr(s, attr))
+
+
+class DeltaTransformer(BaseConversionTransformer):
+    """Transformer based on the delta of a sample volume."""
+
+    def __init__(self, target=None, growth_only=False, **kwargs):
+        """Initialize transformer with configured parameters.
+
+        :param growth_only: capture only positive deltas
+        """
+        super(DeltaTransformer, self).__init__(target=target, **kwargs)
+        self.growth_only = growth_only
+        self.cache = {}
+
+    def handle_sample(self, context, s):
+        """Handle a sample, converting if necessary."""
+        key = s.name + s.resource_id
+        prev = self.cache.get(key)
+        timestamp = timeutils.parse_isotime(s.timestamp)
+        self.cache[key] = (s.volume, timestamp)
+
+        if prev:
+            prev_volume = prev[0]
+            prev_timestamp = prev[1]
+            time_delta = timeutils.delta_seconds(prev_timestamp, timestamp)
+            # disallow violations of the arrow of time
+            if time_delta < 0:
+                LOG.warning(_LW('Dropping out of time order sample: %s'), (s,))
+                # Reset the cache to the newer sample.
+                self.cache[key] = prev
+                return None
+            volume_delta = s.volume - prev_volume
+            if self.growth_only and volume_delta < 0:
+                LOG.warning(_LW('Negative delta detected, dropping value'))
+                s = None
+            else:
+                s = self._convert(s, volume_delta)
+                LOG.debug('Converted to: %s', s)
+        else:
+            LOG.warning(_LW('Dropping sample with no predecessor: %s'), (s,))
+            s = None
+        return s
+
+    def _convert(self, s, delta):
+        """Transform the appropriate sample fields."""
+        return sample.Sample(
+            name=self._map(s, 'name'),
+            unit=s.unit,
+            type=sample.TYPE_DELTA,
+            volume=delta,
+            user_id=s.user_id,
+            project_id=s.project_id,
+            resource_id=s.resource_id,
+            timestamp=s.timestamp,
+            resource_metadata=s.resource_metadata
+        )
+
+
+class ScalingTransformer(BaseConversionTransformer):
+    """Transformer to apply a scaling conversion."""
+
+    def __init__(self, source=None, target=None, **kwargs):
+        """Initialize transformer with configured parameters.
+
+        :param source: dict containing source sample unit
+        :param target: dict containing target sample name, type,
+                       unit and scaling factor (a missing value
+                       connotes no change)
+        """
+        super(ScalingTransformer, self).__init__(source=source, target=target,
+                                                 **kwargs)
+        self.scale = self.target.get('scale')
+        LOG.debug('scaling conversion transformer with source:'
+                  ' %(source)s target: %(target)s:', {'source': self.source,
+                                                      'target': self.target})
+
+    def _scale(self, s):
+        """Apply the scaling factor.
+
+        Either a straight multiplicative factor or else a string to be eval'd.
+        """
+        ns = transformer.Namespace(s.as_dict())
+
+        scale = self.scale
+        return ((eval(scale, {}, ns) if isinstance(scale, six.string_types)
+                 else s.volume * scale) if scale else s.volume)
 
     def _convert(self, s, growth=1):
         """Transform the appropriate sample fields."""
@@ -89,10 +161,10 @@ class ScalingTransformer(transformer.TransformerBase):
 
     def handle_sample(self, context, s):
         """Handle a sample, converting if necessary."""
-        LOG.debug(_('handling sample %s'), (s,))
+        LOG.debug('handling sample %s', s)
         if self.source.get('unit', s.unit) == s.unit:
             s = self._convert(s)
-            LOG.debug(_('converted to: %s'), (s,))
+            LOG.debug('converted to: %s', s)
         return s
 
 
@@ -111,7 +183,7 @@ class RateOfChangeTransformer(ScalingTransformer):
 
     def handle_sample(self, context, s):
         """Handle a sample, converting if necessary."""
-        LOG.debug(_('handling sample %s'), (s,))
+        LOG.debug('handling sample %s', s)
         key = s.name + s.resource_id
         prev = self.cache.get(key)
         timestamp = timeutils.parse_isotime(s.timestamp)
@@ -121,9 +193,16 @@ class RateOfChangeTransformer(ScalingTransformer):
             prev_volume = prev[0]
             prev_timestamp = prev[1]
             time_delta = timeutils.delta_seconds(prev_timestamp, timestamp)
-            # we only allow negative deltas for noncumulative samples, whereas
-            # for cumulative we assume that a reset has occurred in the interim
-            # so that the current volume gives a lower bound on growth
+            # disallow violations of the arrow of time
+            if time_delta < 0:
+                LOG.warning(_('dropping out of time order sample: %s'), (s,))
+                # Reset the cache to the newer sample.
+                self.cache[key] = prev
+                return None
+            # we only allow negative volume deltas for noncumulative
+            # samples, whereas for cumulative we assume that a reset has
+            # occurred in the interim so that the current volume gives a
+            # lower bound on growth
             volume_delta = (s.volume - prev_volume
                             if (prev_volume <= s.volume or
                                 s.type != sample.TYPE_CUMULATIVE)
@@ -132,10 +211,10 @@ class RateOfChangeTransformer(ScalingTransformer):
                               if time_delta else 0.0)
 
             s = self._convert(s, rate_of_change)
-            LOG.debug(_('converted to: %s'), (s,))
+            LOG.debug('converted to: %s', s)
         else:
-            LOG.warn(_('dropping sample with no predecessor: %s'),
-                     (s,))
+            LOG.warning(_('dropping sample with no predecessor: %s'),
+                        (s,))
             s = None
         return s
 
@@ -157,16 +236,30 @@ class AggregatorTransformer(ScalingTransformer):
 
         AggregatorTransformer(size=15, user_id='first',
                               resource_metadata='drop')
+
+      To keep the timestamp of the last received sample rather
+      than the first:
+
+        AggregatorTransformer(timestamp="last")
+
     """
 
     def __init__(self, size=1, retention_time=None,
                  project_id=None, user_id=None, resource_metadata="last",
-                 **kwargs):
+                 timestamp="first", **kwargs):
         super(AggregatorTransformer, self).__init__(**kwargs)
         self.samples = {}
         self.counts = collections.defaultdict(int)
         self.size = int(size) if size else None
         self.retention_time = float(retention_time) if retention_time else None
+        if not (self.size or self.retention_time):
+            self.size = 1
+
+        if timestamp in ["first", "last"]:
+            self.timestamp = timestamp
+        else:
+            self.timestamp = "first"
+
         self.initial_timestamp = None
         self.aggregated_samples = 0
 
@@ -183,7 +276,7 @@ class AggregatorTransformer(ScalingTransformer):
         drop = ['drop'] if is_droppable else []
         if value or mandatory:
             if value not in ['last', 'first'] + drop:
-                LOG.warn('%s is unknown (%s), using last' % (name, value))
+                LOG.warning('%s is unknown (%s), using last' % (name, value))
                 value = 'last'
             self.merged_attribute_policy[name] = value
         else:
@@ -213,6 +306,8 @@ class AggregatorTransformer(ScalingTransformer):
                     'resource_metadata'] == 'drop':
                 self.samples[key].resource_metadata = {}
         else:
+            if self.timestamp == "last":
+                self.samples[key].timestamp = sample_.timestamp
             if sample_.type == sample.TYPE_CUMULATIVE:
                 self.samples[key].volume = self._scale(sample_)
             else:
@@ -229,7 +324,7 @@ class AggregatorTransformer(ScalingTransformer):
         expired = (self.retention_time and
                    timeutils.is_older_than(self.initial_timestamp,
                                            self.retention_time))
-        full = self.aggregated_samples >= self.size
+        full = self.size and self.aggregated_samples >= self.size
         if full or expired:
             x = list(self.samples.values())
             # gauge aggregates need to be averages

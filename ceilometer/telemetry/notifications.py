@@ -30,8 +30,7 @@ cfg.CONF.register_opts(OPTS)
 class TelemetryBase(plugin_base.NotificationBase):
     """Convert telemetry notification into Samples."""
 
-    @staticmethod
-    def get_targets(conf):
+    def get_targets(self, conf):
         """Return a sequence of oslo_messaging.Target
 
         Sequence defining the exchange and topics to be connected for this
@@ -39,16 +38,19 @@ class TelemetryBase(plugin_base.NotificationBase):
         """
         return [oslo_messaging.Target(
                 topic=topic, exchange=conf.ceilometer_control_exchange)
-                for topic in conf.notification_topics]
+                for topic in self.get_notification_topics(conf)]
 
 
-class TelemetryApiPost(TelemetryBase):
-    """Handle sample from notification bus, which is posted via API."""
+class TelemetryIpc(TelemetryBase):
+    """Handle sample from notification bus
 
-    event_types = ['telemetry.api']
+     Telemetry samples can be posted via API or polled by Polling agent.
+     """
+
+    event_types = ['telemetry.api', 'telemetry.polling']
 
     def process_notification(self, message):
-        samples = message['payload']
+        samples = message['payload']['samples']
         for sample_dict in samples:
             yield sample.Sample(
                 name=sample_dict['counter_name'],

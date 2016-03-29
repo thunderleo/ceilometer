@@ -18,7 +18,6 @@
 """
 
 from oslo_config import cfg
-from oslo_log import log
 import oslo_messaging
 
 from ceilometer.agent import plugin_base
@@ -27,13 +26,10 @@ from ceilometer import sample
 OPTS = [
     cfg.StrOpt('neutron_control_exchange',
                default='neutron',
-               help="Exchange name for Neutron notifications.",
-               deprecated_name='quantum_control_exchange'),
+               help="Exchange name for Neutron notifications."),
 ]
 
 cfg.CONF.register_opts(OPTS)
-
-LOG = log.getLogger(__name__)
 
 
 class NetworkNotificationBase(plugin_base.NotificationBase):
@@ -59,8 +55,7 @@ class NetworkNotificationBase(plugin_base.NotificationBase):
             # '%s.delete.start' % (self.resource_name),
         ]
 
-    @staticmethod
-    def get_targets(conf):
+    def get_targets(self, conf):
         """Return a sequence of oslo_messaging.Target
 
         This sequence is defining the exchange and topics to be connected for
@@ -68,7 +63,7 @@ class NetworkNotificationBase(plugin_base.NotificationBase):
         """
         return [oslo_messaging.Target(topic=topic,
                                       exchange=conf.neutron_control_exchange)
-                for topic in conf.notification_topics]
+                for topic in self.get_notification_topics(conf)]
 
     def process_notification(self, message):
         counter_name = getattr(self, 'counter_name', self.resource_name)
@@ -151,25 +146,6 @@ class FloatingIP(NetworkNotificationBase,
     resource_name = 'floatingip'
     counter_name = 'ip.floating'
     unit = 'ip'
-
-
-class Bandwidth(NetworkNotificationBase):
-    """Listen for Neutron notifications.
-
-    Listen in order to mediate with the metering framework.
-    """
-    event_types = ['l3.meter']
-
-    def process_notification(self, message):
-        yield sample.Sample.from_notification(
-            name='bandwidth',
-            type=sample.TYPE_DELTA,
-            unit='B',
-            volume=message['payload']['bytes'],
-            user_id=None,
-            project_id=message['payload']['tenant_id'],
-            resource_id=message['payload']['label_id'],
-            message=message)
 
 
 class Pool(NetworkNotificationBase, plugin_base.NonMetricNotificationBase):

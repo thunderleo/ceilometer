@@ -18,12 +18,13 @@
 # under the License.
 
 import abc
-import fnmatch
 import hashlib
+from itertools import chain
 import os
 
 from oslo_config import cfg
 from oslo_log import log
+import oslo_messaging
 from oslo_utils import timeutils
 import six
 from stevedore import extension
@@ -31,10 +32,11 @@ import yaml
 
 
 from ceilometer.event.storage import models
-from ceilometer.i18n import _
+from ceilometer.i18n import _, _LI, _LW
 from ceilometer import publisher
 from ceilometer.publisher import utils as publisher_utils
 from ceilometer import sample as sample_util
+from ceilometer import utils
 
 
 OPTS = [
@@ -49,6 +51,10 @@ OPTS = [
     cfg.BoolOpt('refresh_pipeline_cfg',
                 default=False,
                 help="Refresh Pipeline configuration on-the-fly."
+                ),
+    cfg.BoolOpt('refresh_event_pipeline_cfg',
+                default=False,
+                help="Refresh Event Pipeline configuration on-the-fly."
                 ),
     cfg.IntOpt('pipeline_polling_interval',
                default=20,
@@ -78,12 +84,13 @@ class PipelineEndpoint(object):
         self.publish_context = PublishContext(context, [pipeline])
 
     @abc.abstractmethod
-    def sample(self, ctxt, publisher_id, event_type, payload, metadata):
+    def sample(self, messages):
         pass
 
 
 class SamplePipelineEndpoint(PipelineEndpoint):
-    def sample(self, ctxt, publisher_id, event_type, payload, metadata):
+    def sample(self, messages):
+        samples = chain.from_iterable(m["payload"] for m in messages)
         samples = [
             sample_util.Sample(name=s['counter_name'],
                                type=s['counter_type'],
@@ -95,7 +102,7 @@ class SamplePipelineEndpoint(PipelineEndpoint):
                                timestamp=s['timestamp'],
                                resource_metadata=s['resource_metadata'],
                                source=s.get('source'))
-            for s in payload if publisher_utils.verify_signature(
+            for s in samples if publisher_utils.verify_signature(
                 s, cfg.CONF.publisher.telemetry_secret)
         ]
         with self.publish_context as p:
@@ -103,7 +110,8 @@ class SamplePipelineEndpoint(PipelineEndpoint):
 
 
 class EventPipelineEndpoint(PipelineEndpoint):
-    def sample(self, ctxt, publisher_id, event_type, payload, metadata):
+    def sample(self, messages):
+        events = chain.from_iterable(m["payload"] for m in messages)
         events = [
             models.Event(
                 message_id=ev['message_id'],
@@ -114,22 +122,36 @@ class EventPipelineEndpoint(PipelineEndpoint):
                                      models.Trait.convert_value(dtype, value))
                         for name, dtype, value in ev['traits']],
                 raw=ev.get('raw', {}))
-            for ev in payload if publisher_utils.verify_signature(
+            for ev in events if publisher_utils.verify_signature(
                 ev, cfg.CONF.publisher.telemetry_secret)
         ]
-        with self.publish_context as p:
-            p(events)
+        try:
+            with self.publish_context as p:
+                p(events)
+        except Exception:
+            if not cfg.CONF.notification.ack_on_event_error:
+                return oslo_messaging.NotificationResult.REQUEUE
+            raise
+        return oslo_messaging.NotificationResult.HANDLED
 
 
 class _PipelineTransportManager(object):
     def __init__(self):
         self.transporters = []
 
+    @staticmethod
+    def hash_grouping(datapoint, grouping_keys):
+        value = ''
+        for key in grouping_keys or []:
+            value += datapoint.get(key) if datapoint.get(key) else ''
+        return hash(value)
+
     def add_transporter(self, transporter):
         self.transporters.append(transporter)
 
     def publisher(self, context):
         serializer = self.serializer
+        hash_grouping = self.hash_grouping
         transporters = self.transporters
         filter_attr = self.filter_attr
         event_type = self.event_type
@@ -137,13 +159,21 @@ class _PipelineTransportManager(object):
         class PipelinePublishContext(object):
             def __enter__(self):
                 def p(data):
-                    serialized_data = serializer(data)
-                    for d_filter, notifier in transporters:
-                        if any(d_filter(d[filter_attr])
-                               for d in serialized_data):
-                            notifier.sample(context.to_dict(),
-                                            event_type=event_type,
-                                            payload=serialized_data)
+                    # TODO(gordc): cleanup so payload is always single
+                    #              datapoint. we can't correctly bucketise
+                    #              datapoints if batched.
+                    data = [data] if not isinstance(data, list) else data
+                    for datapoint in data:
+                        serialized_data = serializer(datapoint)
+                        for d_filter, grouping_keys, notifiers in transporters:
+                            if d_filter(serialized_data[filter_attr]):
+                                key = (hash_grouping(serialized_data,
+                                                     grouping_keys)
+                                       % len(notifiers))
+                                notifier = notifiers[key]
+                                notifier.sample(context.to_dict(),
+                                                event_type=event_type,
+                                                payload=[serialized_data])
                 return p
 
             def __exit__(self, exc_type, exc_value, traceback):
@@ -158,8 +188,8 @@ class SamplePipelineTransportManager(_PipelineTransportManager):
 
     @staticmethod
     def serializer(data):
-        return [publisher_utils.meter_message_from_counter(
-            sample, cfg.CONF.publisher.telemetry_secret) for sample in data]
+        return publisher_utils.meter_message_from_counter(
+            data, cfg.CONF.publisher.telemetry_secret)
 
 
 class EventPipelineTransportManager(_PipelineTransportManager):
@@ -168,8 +198,8 @@ class EventPipelineTransportManager(_PipelineTransportManager):
 
     @staticmethod
     def serializer(data):
-        return [publisher_utils.message_from_event(
-            data, cfg.CONF.publisher.telemetry_secret)]
+        return publisher_utils.message_from_event(
+            data, cfg.CONF.publisher.telemetry_secret)
 
 
 class PublishContext(object):
@@ -245,11 +275,11 @@ class Source(object):
     def is_supported(dataset, data_name):
         # Support wildcard like storage.* and !disk.*
         # Start with negation, we consider that the order is deny, allow
-        if any(fnmatch.fnmatch(data_name, datapoint[1:])
+        if any(utils.match(data_name, datapoint[1:])
                for datapoint in dataset if datapoint[0] == '!'):
             return False
 
-        if any(fnmatch.fnmatch(data_name, datapoint)
+        if any(utils.match(data_name, datapoint)
                for datapoint in dataset if datapoint[0] != '!'):
             return True
 
@@ -266,11 +296,7 @@ class EventSource(Source):
 
     def __init__(self, cfg):
         super(EventSource, self).__init__(cfg)
-        try:
-            self.events = cfg['events']
-        except KeyError as err:
-            raise PipelineException(
-                "Required field %s not specified" % err.args[0], cfg)
+        self.events = cfg.get('events')
         self.check_source_filtering(self.events, 'events')
 
     def support_event(self, event_name):
@@ -288,13 +314,8 @@ class SampleSource(Source):
 
     def __init__(self, cfg):
         super(SampleSource, self).__init__(cfg)
-        try:
-            # Support 'counters' for backward compatibility
-            self.meters = cfg.get('meters', cfg.get('counters'))
-        except KeyError as err:
-            raise PipelineException(
-                "Required field %s not specified" % err.args[0], cfg)
-
+        # Support 'counters' for backward compatibility
+        self.meters = cfg.get('meters', cfg.get('counters'))
         try:
             self.interval = int(cfg.get('interval', 600))
         except ValueError:
@@ -311,19 +332,10 @@ class SampleSource(Source):
             raise PipelineException("Discovery should be a list", cfg)
         self.check_source_filtering(self.meters, 'meters')
 
-    # (yjiang5) To support meters like instance:m1.tiny,
-    # which include variable part at the end starting with ':'.
-    # Hope we will not add such meters in future.
-    @staticmethod
-    def _variable_meter_name(name):
-        m = name.partition(':')
-        if m[1] == ':':
-            return m[1].join((m[0], '*'))
-        else:
-            return name
+    def get_interval(self):
+        return self.interval
 
     def support_meter(self, meter_name):
-        meter_name = self._variable_meter_name(meter_name)
         return self.is_supported(self.meters, meter_name)
 
 
@@ -377,6 +389,7 @@ class Sink(object):
             except Exception:
                 LOG.exception(_("Unable to load publisher %s"), p)
 
+        self.multi_publish = True if len(self.publishers) > 1 else False
         self.transformers = self._setup_transformers(cfg, transformer_manager)
 
     def __str__(self):
@@ -393,7 +406,7 @@ class Sink(object):
                     "No transformer named %s loaded" % transformer['name'],
                     cfg)
             transformers.append(ext.plugin(**parameter))
-            LOG.info(_(
+            LOG.info(_LI(
                 "Pipeline %(pipeline)s: Setup transformer instance %(name)s "
                 "with parameter %(param)s") % ({'pipeline': self,
                                                 'name': transformer['name'],
@@ -412,10 +425,13 @@ class EventSink(Sink):
                 try:
                     p.publish_events(ctxt, events)
                 except Exception:
-                    LOG.exception(_(
-                        "Pipeline %(pipeline)s: Continue after error "
-                        "from publisher %(pub)s") % ({'pipeline': self,
-                                                      'pub': p}))
+                    LOG.exception(_("Pipeline %(pipeline)s: %(status)s"
+                                    " after error from publisher %(pub)s") %
+                                   ({'pipeline': self, 'status': 'Continue' if
+                                     self.multi_publish else 'Exit', 'pub': p}
+                                    ))
+                    if not self.multi_publish:
+                        raise
 
     def flush(self, ctxt):
         """Flush data after all events have been injected to pipeline."""
@@ -431,10 +447,10 @@ class SampleSink(Sink):
             for transformer in self.transformers[start:]:
                 sample = transformer.handle_sample(ctxt, sample)
                 if not sample:
-                    LOG.debug(_(
+                    LOG.debug(
                         "Pipeline %(pipeline)s: Sample dropped by "
-                        "transformer %(trans)s") % ({'pipeline': self,
-                                                     'trans': transformer}))
+                        "transformer %(trans)s", {'pipeline': self,
+                                                  'trans': transformer})
                     return
             return sample
         except Exception as err:
@@ -462,11 +478,11 @@ class SampleSink(Sink):
             transformed_samples = samples
         else:
             for sample in samples:
-                LOG.debug(_(
+                LOG.debug(
                     "Pipeline %(pipeline)s: Transform sample "
-                    "%(smp)s from %(trans)s transformer") % ({'pipeline': self,
-                                                              'smp': sample,
-                                                              'trans': start}))
+                    "%(smp)s from %(trans)s transformer", {'pipeline': self,
+                                                           'smp': sample,
+                                                           'trans': start})
                 sample = self._transform_sample(start, ctxt, sample)
                 if sample:
                     transformed_samples.append(sample)
@@ -560,10 +576,40 @@ class SamplePipeline(Pipeline):
     def support_meter(self, meter_name):
         return self.source.support_meter(meter_name)
 
+    def _validate_volume(self, s):
+        volume = s.volume
+        if volume is None:
+            LOG.warning(_LW(
+                'metering data %(counter_name)s for %(resource_id)s '
+                '@ %(timestamp)s has no volume (volume: None), the sample will'
+                ' be dropped')
+                % {'counter_name': s.name,
+                   'resource_id': s.resource_id,
+                   'timestamp': s.timestamp if s.timestamp else 'NO TIMESTAMP'}
+            )
+            return False
+        if not isinstance(volume, (int, float)):
+            try:
+                volume = float(volume)
+            except ValueError:
+                LOG.warning(_LW(
+                    'metering data %(counter_name)s for %(resource_id)s '
+                    '@ %(timestamp)s has volume which is not a number '
+                    '(volume: %(counter_volume)s), the sample will be dropped')
+                    % {'counter_name': s.name,
+                       'resource_id': s.resource_id,
+                       'timestamp': (
+                           s.timestamp if s.timestamp else 'NO TIMESTAMP'),
+                       'counter_volume': volume}
+                )
+                return False
+        return True
+
     def publish_data(self, ctxt, samples):
         if not isinstance(samples, list):
             samples = [samples]
-        supported = [s for s in samples if self.source.support_meter(s.name)]
+        supported = [s for s in samples if self.source.support_meter(s.name)
+                     and self._validate_volume(s)]
         self.sink.publish_samples(ctxt, supported)
 
 
@@ -637,8 +683,7 @@ class PipelineManager(object):
         "meter_name" will be excluded; 'meter_name' means 'meter_name'
         will be included.
 
-        The 'meter_name" is Sample name field. For meter names with
-        variable like "instance:m1.tiny", it's "instance:*".
+        The 'meter_name" is Sample name field.
 
         Valid meters definition is all "included meter names", all
         "excluded meter names", wildcard and "excluded meter names", or
@@ -657,7 +702,7 @@ class PipelineManager(object):
         if not ('sources' in cfg and 'sinks' in cfg):
             raise PipelineException("Both sources & sinks are required",
                                     cfg)
-        LOG.info(_('detected decoupled pipeline config format'))
+        LOG.info(_LI('detected decoupled pipeline config format'))
 
         unique_names = set()
         sources = []
@@ -704,23 +749,67 @@ class PipelineManager(object):
         return PublishContext(context, self.pipelines)
 
 
+class PollingManager(object):
+    """Polling Manager
+
+    Polling manager sets up polling according to config file.
+    """
+
+    def __init__(self, cfg):
+        """Setup the polling according to config.
+
+        The configuration is the sources half of the Pipeline Config.
+        """
+        self.sources = []
+        if not ('sources' in cfg and 'sinks' in cfg):
+            raise PipelineException("Both sources & sinks are required",
+                                    cfg)
+        LOG.info(_LI('detected decoupled pipeline config format'))
+
+        unique_names = set()
+        for s in cfg.get('sources', []):
+            name = s.get('name')
+            if name in unique_names:
+                raise PipelineException("Duplicated source names: %s" %
+                                        name, self)
+            else:
+                unique_names.add(name)
+                self.sources.append(SampleSource(s))
+        unique_names.clear()
+
+
 def _setup_pipeline_manager(cfg_file, transformer_manager, p_type=SAMPLE_TYPE):
     if not os.path.exists(cfg_file):
         cfg_file = cfg.CONF.find_file(cfg_file)
 
-    LOG.debug(_("Pipeline config file: %s"), cfg_file)
+    LOG.debug("Pipeline config file: %s", cfg_file)
 
     with open(cfg_file) as fap:
         data = fap.read()
 
     pipeline_cfg = yaml.safe_load(data)
-    LOG.info(_("Pipeline config: %s"), pipeline_cfg)
+    LOG.info(_LI("Pipeline config: %s"), pipeline_cfg)
 
     return PipelineManager(pipeline_cfg,
                            transformer_manager or
                            extension.ExtensionManager(
                                'ceilometer.transformer',
                            ), p_type)
+
+
+def _setup_polling_manager(cfg_file):
+    if not os.path.exists(cfg_file):
+        cfg_file = cfg.CONF.find_file(cfg_file)
+
+    LOG.debug("Polling config file: %s", cfg_file)
+
+    with open(cfg_file) as fap:
+        data = fap.read()
+
+    pipeline_cfg = yaml.safe_load(data)
+    LOG.info(_LI("Pipeline config: %s"), pipeline_cfg)
+
+    return PollingManager(pipeline_cfg)
 
 
 def setup_event_pipeline(transformer_manager=None):
@@ -762,3 +851,16 @@ def get_pipeline_hash(p_type=SAMPLE_TYPE):
 
     file_hash = hashlib.md5(data).hexdigest()
     return file_hash
+
+
+def setup_polling():
+    """Setup polling manager according to yaml config file."""
+    cfg_file = cfg.CONF.pipeline_cfg_file
+    return _setup_polling_manager(cfg_file)
+
+
+def get_pipeline_grouping_key(pipe):
+    keys = []
+    for transformer in pipe.sink.transformers:
+        keys += transformer.grouping_keys
+    return list(set(keys))

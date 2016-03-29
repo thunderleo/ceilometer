@@ -91,8 +91,7 @@ corresponding sinks for transformation and publication of the samples.
 
 A source is a producer of samples, in effect a set of pollsters and/or
 notification handlers emitting samples for a set of matching meters.
-See :doc:`plugins` and :ref:`plugins-and-containers` for
-details on how to write and plug in your plugins.
+See :doc:`plugins` for details on how to write and plug in your plugins.
 
 Each source configuration encapsulates meter name matching, polling
 interval determination, optional resource enumeration or discovery,
@@ -163,7 +162,7 @@ with which a source should operate:
   * To define the list of included meters, use the 'meter_name' syntax
   * To define the list of excluded meters, use the '!meter_name' syntax
   * For meters, which identify a complex Sample field, use the wildcard
-    symbol to select all, e.g. for "instance:m1.tiny", use "instance:\*"
+    symbol to select all, e.g. for "disk.read.bytes", use "disk.\*"
 
 The above definition methods can be used in the following combinations:
 
@@ -216,7 +215,7 @@ as the names of the related extensions in setup.cfg. For a more detailed
 description, please see the `transformers`_ section of the Administrator Guide
 of Ceilometer.
 
-.. _transformers: http://docs.openstack.org/admin-guide-cloud/content/section_telemetry-pipeline-transformers.html
+.. _transformers: http://docs.openstack.org/admin-guide-cloud/telemetry-data-collection.html#transformers
 
 The *publishers* section contains the list of publishers, where the samples
 data should be sent after the possible transformations. The names of the
@@ -233,4 +232,4 @@ Publishers
 For more information about publishers see the `publishers`_ section of the
 Administrator Guide of Ceilometer.
 
-.. _publishers: http://docs.openstack.org/admin-guide-cloud/content/section_telemetry-publishers.html
+.. _publishers: http://docs.openstack.org/admin-guide-cloud/telemetry-data-retrieval.html#publishers

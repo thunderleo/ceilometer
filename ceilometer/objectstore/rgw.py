@@ -15,14 +15,14 @@
 """Common code for working with ceph object stores
 """
 
-from keystoneclient import exceptions
+from keystoneauth1 import exceptions
 from oslo_config import cfg
 from oslo_log import log
 from oslo_utils import timeutils
 import six.moves.urllib.parse as urlparse
 
 from ceilometer.agent import plugin_base
-from ceilometer.i18n import _
+from ceilometer import keystone_client
 from ceilometer import sample
 
 LOG = log.getLogger(__name__)
@@ -71,12 +71,13 @@ class _Base(plugin_base.PollsterBase):
         if _Base._ENDPOINT is None:
             try:
                 conf = cfg.CONF.service_credentials
-                rgw_url = ksclient.service_catalog.url_for(
-                    service_type=cfg.CONF.service_types.radosgw,
-                    endpoint_type=conf.os_endpoint_type)
+                rgw_url = keystone_client.get_service_catalog(
+                    ksclient).url_for(
+                        service_type=cfg.CONF.service_types.radosgw,
+                        interface=conf.interface)
                 _Base._ENDPOINT = urlparse.urljoin(rgw_url, '/admin')
             except exceptions.EndpointNotFound:
-                LOG.debug(_("Radosgw endpoint not found"))
+                LOG.debug("Radosgw endpoint not found")
         return _Base._ENDPOINT
 
     def _iter_accounts(self, ksclient, cache, tenants):
@@ -93,8 +94,8 @@ class _Base(plugin_base.PollsterBase):
         try:
             from ceilometer.objectstore.rgw_client import RGWAdminClient
             rgw_client = RGWAdminClient(endpoint, self.access_key, self.secret)
-        except ImportError as e:
-            raise plugin_base.PollsterPermanentError(e)
+        except ImportError:
+            raise plugin_base.PollsterPermanentError(tenants)
 
         for t in tenants:
             api_method = 'get_%s' % self.METHOD
@@ -116,7 +117,7 @@ class ContainersObjectsPollster(_Base):
                     user_id=None,
                     project_id=tenant,
                     resource_id=tenant + '/' + it.name,
-                    timestamp=timeutils.isotime(),
+                    timestamp=timeutils.utcnow().isoformat(),
                     resource_metadata=None,
                 )
 
@@ -136,7 +137,7 @@ class ContainersSizePollster(_Base):
                         user_id=None,
                         project_id=tenant,
                         resource_id=tenant + '/' + it.name,
-                        timestamp=timeutils.isotime(),
+                        timestamp=timeutils.utcnow().isoformat(),
                         resource_metadata=None,
                     )
 
@@ -155,7 +156,7 @@ class ObjectsSizePollster(_Base):
                 user_id=None,
                 project_id=tenant,
                 resource_id=tenant,
-                timestamp=timeutils.isotime(),
+                timestamp=timeutils.utcnow().isoformat(),
                 resource_metadata=None,
                 )
 
@@ -174,7 +175,7 @@ class ObjectsPollster(_Base):
                 user_id=None,
                 project_id=tenant,
                 resource_id=tenant,
-                timestamp=timeutils.isotime(),
+                timestamp=timeutils.utcnow().isoformat(),
                 resource_metadata=None,
                 )
 
@@ -191,7 +192,7 @@ class ObjectsContainersPollster(_Base):
                 user_id=None,
                 project_id=tenant,
                 resource_id=tenant,
-                timestamp=timeutils.isotime(),
+                timestamp=timeutils.utcnow().isoformat(),
                 resource_metadata=None,
                 )
 
@@ -211,6 +212,6 @@ class UsagePollster(_Base):
                 user_id=None,
                 project_id=tenant,
                 resource_id=tenant,
-                timestamp=timeutils.isotime(),
+                timestamp=timeutils.utcnow().isoformat(),
                 resource_metadata=None,
                 )

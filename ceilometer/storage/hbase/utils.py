@@ -297,7 +297,7 @@ def make_meter_query_for_resource(start_timestamp, start_timestamp_op,
     if mq:
         meter_q = " AND ".join(mq)
         # If there is a filtering on time_range we need to point that
-        # qualifiers should start with m_. Overwise in case e.g.
+        # qualifiers should start with m_. Otherwise in case e.g.
         # QualifierFilter (>=, 'binaryprefix:m_9222030811134775808')
         # qualifier 's_test' satisfies the filter and will be returned.
         meter_q = _QualifierFilter("=", '') + " AND " + meter_q
@@ -385,7 +385,7 @@ def deserialize_entry(entry, get_raw_meta=True):
     else:
         metadata = metadata_flattened
 
-    return flatten_result, sources, meters, metadata
+    return flatten_result, meters, metadata
 
 
 def serialize_entry(data=None, **kwargs):
@@ -471,9 +471,9 @@ def create_tables(conn, tables, column_families):
                               separator=conn.table_prefix_separator,
                               table_name=table))
 
-            LOG.warn(_("Cannot create table %(table_name)s   "
-                       "it already exists. Ignoring error")
-                     % {'table_name': table})
+            LOG.warning(_("Cannot create table %(table_name)s   "
+                        "it already exists. Ignoring error")
+                        % {'table_name': table})
 
 
 def quote(s, *args):

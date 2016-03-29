@@ -70,7 +70,7 @@ class OpenDayLightDriver(driver.Driver):
       This is password that is used by auth.(default None)
     * container_name:
       Name of container of OpenDaylight.(default "default")
-      This parameter allows multi vaues.
+      This parameter allows multi values.
 
     e.g.::
 
@@ -121,7 +121,7 @@ class OpenDayLightDriver(driver.Driver):
                 container_data['topology'] = cs.topology.get_topology(
                     container_name)
 
-                # get switch informations
+                # get switch information
                 container_data['switch'] = cs.switch_manager.get_nodes(
                     container_name)
 
@@ -162,7 +162,7 @@ class OpenDayLightDriver(driver.Driver):
                 container_data['inactive_hosts'] = (
                     cs.host_tracker.get_inactive_hosts(container_name))
 
-                container_data['timestamp'] = timeutils.isotime()
+                container_data['timestamp'] = timeutils.utcnow().isoformat()
 
                 data[container_name] = container_data
             except Exception:

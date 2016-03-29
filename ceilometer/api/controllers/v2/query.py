@@ -28,10 +28,9 @@ from pecan import rest
 from wsme import types as wtypes
 import wsmeext.pecan as wsme_pecan
 
-from ceilometer.alarm.storage import models as alarm_models
-from ceilometer.api.controllers.v2 import alarms
 from ceilometer.api.controllers.v2 import base
 from ceilometer.api.controllers.v2 import samples
+from ceilometer.api.controllers.v2 import utils as v2_utils
 from ceilometer.api import rbac
 from ceilometer.i18n import _
 from ceilometer import storage
@@ -47,7 +46,7 @@ class ComplexQuery(base.Base):
     "The filter expression encoded in json."
 
     orderby = wtypes.text
-    "List of single-element dicts for specifing the ordering of the results."
+    "List of single-element dicts for specifying the ordering of the results."
 
     limit = int
     "The maximum number of results to be returned."
@@ -201,7 +200,7 @@ class ValidatedComplexQuery(object):
                 self._validate_filter(self.filter_expr)
             except (ValueError, jsonschema.exceptions.ValidationError) as e:
                 raise base.ClientSideError(
-                    _("Filter expression not valid: %s") % e.message)
+                    _("Filter expression not valid: %s") % e)
             self._replace_isotime_with_datetime(self.filter_expr)
             self._convert_operator_to_lower_case(self.filter_expr)
             self._normalize_field_names_for_db_model(self.filter_expr)
@@ -220,14 +219,10 @@ class ValidatedComplexQuery(object):
             self._convert_orderby_to_lower_case(self.orderby)
             self._normalize_field_names_in_orderby(self.orderby)
 
-        if self.original_query.limit is wtypes.Unset:
-            self.limit = None
-        else:
-            self.limit = self.original_query.limit
+        self.limit = (None if self.original_query.limit is wtypes.Unset
+                      else self.original_query.limit)
 
-        if self.limit is not None and self.limit <= 0:
-            msg = _('Limit should be positive')
-            raise base.ClientSideError(msg)
+        self.limit = v2_utils.enforce_limit(self.limit)
 
     @staticmethod
     def _convert_orderby_to_lower_case(orderby):
@@ -359,51 +354,6 @@ class QuerySamplesController(rest.RestController):
                                             query.limit)]
 
 
-class QueryAlarmHistoryController(rest.RestController):
-    """Provides complex query possibilities for alarm history."""
-    @wsme_pecan.wsexpose([alarms.AlarmChange], body=ComplexQuery)
-    def post(self, body):
-        """Define query for retrieving AlarmChange data.
-
-        :param body: Query rules for the alarm history to be returned.
-        """
-
-        rbac.enforce('query_alarm_history', pecan.request)
-
-        query = ValidatedComplexQuery(body,
-                                      alarm_models.AlarmChange)
-        query.validate(visibility_field="on_behalf_of")
-        conn = pecan.request.alarm_storage_conn
-        return [alarms.AlarmChange.from_db_model(s)
-                for s in conn.query_alarm_history(query.filter_expr,
-                                                  query.orderby,
-                                                  query.limit)]
-
-
-class QueryAlarmsController(rest.RestController):
-    """Provides complex query possibilities for alarms."""
-    history = QueryAlarmHistoryController()
-
-    @wsme_pecan.wsexpose([alarms.Alarm], body=ComplexQuery)
-    def post(self, body):
-        """Define query for retrieving Alarm data.
-
-        :param body: Query rules for the alarms to be returned.
-        """
-
-        rbac.enforce('query_alarm', pecan.request)
-
-        query = ValidatedComplexQuery(body,
-                                      alarm_models.Alarm)
-        query.validate(visibility_field="project_id")
-        conn = pecan.request.alarm_storage_conn
-        return [alarms.Alarm.from_db_model(s)
-                for s in conn.query_alarms(query.filter_expr,
-                                           query.orderby,
-                                           query.limit)]
-
-
 class QueryController(rest.RestController):
 
     samples = QuerySamplesController()
-    alarms = QueryAlarmsController()

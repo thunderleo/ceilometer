@@ -33,13 +33,17 @@ INSTANCE_PROPERTIES = [
 
 def _get_metadata_from_object(instance):
     """Return a metadata dictionary for the instance."""
+    instance_type = instance.flavor['name'] if instance.flavor else None
     metadata = {
         'display_name': instance.name,
         'name': getattr(instance, 'OS-EXT-SRV-ATTR:instance_name', u''),
-        'instance_type': (instance.flavor['id'] if instance.flavor else None),
+        'instance_id': instance.id,
+        'instance_type': instance_type,
         'host': instance.hostId,
+        'instance_host': getattr(instance, 'OS-EXT-SRV-ATTR:host', u''),
         'flavor': instance.flavor,
         'status': instance.status.lower(),
+        'state': getattr(instance, 'OS-EXT-STS:vm_state', u''),
     }
 
     # Image properties
@@ -84,7 +88,7 @@ def make_sample_from_instance(instance, name, type, unit, volume,
         user_id=instance.user_id,
         project_id=instance.tenant_id,
         resource_id=resource_id or instance.id,
-        timestamp=timeutils.isotime(),
+        timestamp=timeutils.utcnow().isoformat(),
         resource_metadata=resource_metadata,
     )
 

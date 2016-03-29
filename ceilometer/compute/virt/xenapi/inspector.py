@@ -13,9 +13,9 @@
 # under the License.
 """Implementation of Inspector abstraction for XenAPI."""
 
-from eventlet import timeout
 from oslo_config import cfg
 from oslo_utils import units
+import six.moves.urllib.parse as urlparse
 try:
     import XenAPI as api
 except ImportError:
@@ -38,9 +38,6 @@ OPTS = [
     cfg.StrOpt('connection_password',
                help='Password for connection to XenServer/Xen Cloud Platform.',
                secret=True),
-    cfg.IntOpt('login_timeout',
-               default=10,
-               help='Timeout in seconds for XenAPI login.'),
 ]
 
 CONF = cfg.CONF
@@ -50,6 +47,18 @@ CONF.register_opts(OPTS, group=opt_group)
 
 class XenapiException(virt_inspector.InspectorException):
     pass
+
+
+def swap_xapi_host(url, host_addr):
+    """Replace the XenServer address present in 'url' with 'host_addr'."""
+    temp_url = urlparse.urlparse(url)
+    # The connection URL is served by XAPI and doesn't support having a
+    # path for the connection url after the port. And username/password
+    # will be pass separately. So the URL like "http://abc:abc@abc:433/abc"
+    # should not appear for XAPI case.
+    temp_netloc = temp_url.netloc.replace(temp_url.hostname, '%s' % host_addr)
+    replaced = temp_url._replace(netloc=temp_netloc)
+    return urlparse.urlunparse(replaced)
 
 
 def get_api_session():
@@ -63,15 +72,23 @@ def get_api_session():
         raise XenapiException(_('Must specify connection_url, and '
                                 'connection_password to use'))
 
-    exception = api.Failure(_("Unable to log in to XenAPI "
-                              "(is the Dom0 disk full?)"))
     try:
-        session = api.Session(url)
-        with timeout.Timeout(CONF.xenapi.login_timeout, exception):
-            session.login_with_password(username, password)
+        session = (api.xapi_local() if url == 'unix://local'
+                   else api.Session(url))
+        session.login_with_password(username, password)
     except api.Failure as e:
-        msg = _("Could not connect to XenAPI: %s") % e.details[0]
-        raise XenapiException(msg)
+        if e.details[0] == 'HOST_IS_SLAVE':
+            master = e.details[1]
+            url = swap_xapi_host(url, master)
+            try:
+                session = api.Session(url)
+                session.login_with_password(username, password)
+            except api.Failure as es:
+                raise XenapiException(_('Could not connect slave host: %s ') %
+                                      es.details[0])
+        else:
+            msg = _("Could not connect to XenAPI: %s") % e.details[0]
+            raise XenapiException(msg)
     return session
 
 

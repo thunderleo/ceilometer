@@ -31,9 +31,10 @@ from sqlalchemy import and_
 from sqlalchemy import distinct
 from sqlalchemy import func
 from sqlalchemy.orm import aliased
+from sqlalchemy.sql.expression import cast
 
 import ceilometer
-from ceilometer.i18n import _
+from ceilometer.i18n import _, _LI
 from ceilometer import storage
 from ceilometer.storage import base
 from ceilometer.storage import models as api_models
@@ -156,8 +157,12 @@ def make_query_from_filter(session, query, sample_filter, require_meter=True):
         else:
             query = query.filter(models.Sample.timestamp < ts_end)
     if sample_filter.user:
+        if sample_filter.user == 'None':
+            sample_filter.user = None
         query = query.filter(models.Resource.user_id == sample_filter.user)
     if sample_filter.project:
+        if sample_filter.project == 'None':
+            sample_filter.project = None
         query = query.filter(
             models.Resource.project_id == sample_filter.project)
     if sample_filter.resource:
@@ -222,6 +227,9 @@ class Connection(base.Connection):
         # in storage.__init__.get_connection_from_config function
         options = dict(cfg.CONF.database.items())
         options['max_retries'] = 0
+        # oslo.db doesn't support options defined by Ceilometer
+        for opt in storage.OPTS:
+            options.pop(opt.name, None)
         self._engine_facade = db_session.EngineFacade(url, **options)
 
     def upgrade(self):
@@ -303,8 +311,9 @@ class Connection(base.Connection):
                                     {'id': internal_id, 'meta_key': key,
                                      'value': v})
                             except KeyError:
-                                LOG.warn(_("Unknown metadata type. Key (%s) "
-                                         "will not be queryable."), key)
+                                LOG.warning(_("Unknown metadata type. Key "
+                                              "(%s) will not be queryable."),
+                                            key)
                         for _model in meta_map.keys():
                             conn.execute(_model.__table__.insert(),
                                          meta_map[_model])
@@ -323,7 +332,7 @@ class Connection(base.Connection):
         """Write the data to the backend storage system.
 
         :param data: a dictionary such as returned by
-                     ceilometer.meter.meter_message_from_counter
+                     ceilometer.publisher.utils.meter_message_from_counter
         """
         engine = self._engine_facade.get_engine()
         with engine.begin() as conn:
@@ -352,39 +361,57 @@ class Connection(base.Connection):
         Clearing occurs according to the time-to-live.
         :param ttl: Number of seconds to keep records for.
         """
-
+        # Prevent database deadlocks from occurring by
+        # using separate transaction for each delete
         session = self._engine_facade.get_session()
         with session.begin():
             end = timeutils.utcnow() - datetime.timedelta(seconds=ttl)
             sample_q = (session.query(models.Sample)
                         .filter(models.Sample.timestamp < end))
             rows = sample_q.delete()
-            LOG.info(_("%d samples removed from database"), rows)
+            LOG.info(_LI("%d samples removed from database"), rows)
 
-            if not cfg.CONF.sql_expire_samples_only:
+        if not cfg.CONF.sql_expire_samples_only:
+            with session.begin():
                 # remove Meter definitions with no matching samples
                 (session.query(models.Meter)
                  .filter(~models.Meter.samples.any())
                  .delete(synchronize_session=False))
 
-                # remove resources with no matching samples
+            with session.begin():
                 resource_q = (session.query(models.Resource.internal_id)
                               .filter(~models.Resource.samples.any()))
-                resource_subq = resource_q.subquery()
-                # remove metadata of cleaned resources
-                for table in [models.MetaText, models.MetaBigInt,
-                              models.MetaFloat, models.MetaBool]:
+                # mark resource with no matching samples for delete
+                resource_q.update({models.Resource.metadata_hash: "delete_"
+                                  + cast(models.Resource.internal_id,
+                                         sa.String)},
+                                  synchronize_session=False)
+
+            # remove metadata of resources marked for delete
+            for table in [models.MetaText, models.MetaBigInt,
+                          models.MetaFloat, models.MetaBool]:
+                with session.begin():
+                    resource_q = (session.query(models.Resource.internal_id)
+                                  .filter(models.Resource.metadata_hash
+                                          .like('delete_%')))
+                    resource_subq = resource_q.subquery()
                     (session.query(table)
                      .filter(table.id.in_(resource_subq))
                      .delete(synchronize_session=False))
+
+            # remove resource marked for delete
+            with session.begin():
+                resource_q = (session.query(models.Resource.internal_id)
+                              .filter(models.Resource.metadata_hash
+                                      .like('delete_%')))
                 resource_q.delete(synchronize_session=False)
-                LOG.info(_("Expired residual resource and"
-                           " meter definition data"))
+            LOG.info(_LI("Expired residual resource and"
+                         " meter definition data"))
 
     def get_resources(self, user=None, project=None, source=None,
                       start_timestamp=None, start_timestamp_op=None,
                       end_timestamp=None, end_timestamp_op=None,
-                      metaquery=None, resource=None):
+                      metaquery=None, resource=None, limit=None):
         """Return an iterable of api_models.Resource instances
 
         :param user: Optional ID for user that owns the resource.
@@ -396,7 +423,10 @@ class Connection(base.Connection):
         :param end_timestamp_op: Optional end time operator, like lt, le.
         :param metaquery: Optional dict with metadata to match on.
         :param resource: Optional resource filter.
+        :param limit: Maximum number of results to return.
         """
+        if limit == 0:
+            return
         s_filter = storage.SampleFilter(user=user,
                                         project=project,
                                         source=source,
@@ -409,12 +439,19 @@ class Connection(base.Connection):
 
         session = self._engine_facade.get_session()
         # get list of resource_ids
-        res_q = session.query(distinct(models.Resource.resource_id)).join(
-            models.Sample,
-            models.Sample.resource_id == models.Resource.internal_id)
+        has_timestamp = start_timestamp or end_timestamp
+        # NOTE: When sql_expire_samples_only is enabled, there will be some
+        #       resources without any sample, in such case we should use inner
+        #       join on sample table to avoid wrong result.
+        if cfg.CONF.sql_expire_samples_only or has_timestamp:
+            res_q = session.query(distinct(models.Resource.resource_id)).join(
+                models.Sample,
+                models.Sample.resource_id == models.Resource.internal_id)
+        else:
+            res_q = session.query(distinct(models.Resource.resource_id))
         res_q = make_query_from_filter(session, res_q, s_filter,
                                        require_meter=False)
-
+        res_q = res_q.limit(limit) if limit else res_q
         for res_id in res_q.all():
 
             # get max and min sample timestamp value
@@ -461,7 +498,7 @@ class Connection(base.Connection):
             )
 
     def get_meters(self, user=None, project=None, resource=None, source=None,
-                   metaquery=None):
+                   metaquery=None, limit=None, unique=False):
         """Return an iterable of api_models.Meter instances
 
         :param user: Optional ID for user that owns the resource.
@@ -469,7 +506,11 @@ class Connection(base.Connection):
         :param resource: Optional ID of the resource.
         :param source: Optional source filter.
         :param metaquery: Optional dict with metadata to match on.
+        :param limit: Maximum number of results to return.
+        :param unique: If set to true, return only unique meter information.
         """
+        if limit == 0:
+            return
         s_filter = storage.SampleFilter(user=user,
                                         project=project,
                                         source=source,
@@ -479,10 +520,17 @@ class Connection(base.Connection):
         # NOTE(gordc): get latest sample of each meter/resource. we do not
         #              filter here as we want to filter only on latest record.
         session = self._engine_facade.get_session()
+
         subq = session.query(func.max(models.Sample.id).label('id')).join(
             models.Resource,
-            models.Resource.internal_id == models.Sample.resource_id).group_by(
-            models.Sample.meter_id, models.Resource.resource_id)
+            models.Resource.internal_id == models.Sample.resource_id)
+
+        if unique:
+            subq = subq.group_by(models.Sample.meter_id)
+        else:
+            subq = subq.group_by(models.Sample.meter_id,
+                                 models.Resource.resource_id)
+
         if resource:
             subq = subq.filter(models.Resource.resource_id == resource)
         subq = subq.subquery()
@@ -502,15 +550,28 @@ class Connection(base.Connection):
         query_sample = make_query_from_filter(session, query_sample, s_filter,
                                               require_meter=False)
 
-        for row in query_sample.all():
-            yield api_models.Meter(
-                name=row.name,
-                type=row.type,
-                unit=row.unit,
-                resource_id=row.resource_id,
-                project_id=row.project_id,
-                source=row.source_id,
-                user_id=row.user_id)
+        query_sample = query_sample.limit(limit) if limit else query_sample
+
+        if unique:
+            for row in query_sample.all():
+                yield api_models.Meter(
+                    name=row.name,
+                    type=row.type,
+                    unit=row.unit,
+                    resource_id=None,
+                    project_id=None,
+                    source=None,
+                    user_id=None)
+        else:
+            for row in query_sample.all():
+                yield api_models.Meter(
+                    name=row.name,
+                    type=row.type,
+                    unit=row.unit,
+                    resource_id=row.resource_id,
+                    project_id=row.project_id,
+                    source=row.source_id,
+                    user_id=row.user_id)
 
     @staticmethod
     def _retrieve_samples(query):
@@ -575,7 +636,22 @@ class Connection(base.Connection):
 
         session = self._engine_facade.get_session()
         engine = self._engine_facade.get_engine()
-        query = session.query(models.FullSample)
+        query = session.query(models.Sample.timestamp,
+                              models.Sample.recorded_at,
+                              models.Sample.message_id,
+                              models.Sample.message_signature,
+                              models.Sample.volume.label('counter_volume'),
+                              models.Meter.name.label('counter_name'),
+                              models.Meter.type.label('counter_type'),
+                              models.Meter.unit.label('counter_unit'),
+                              models.Resource.source_id,
+                              models.Resource.user_id,
+                              models.Resource.project_id,
+                              models.Resource.resource_metadata,
+                              models.Resource.resource_id).join(
+            models.Meter, models.Meter.id == models.Sample.meter_id).join(
+            models.Resource,
+            models.Resource.internal_id == models.Sample.resource_id)
         transformer = sql_utils.QueryTransformer(models.FullSample, query,
                                                  dialect=engine.dialect.name)
         if filter_expr is not None:

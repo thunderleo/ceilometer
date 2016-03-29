@@ -120,7 +120,7 @@ class SwitchManagerAPIClient(_Base):
     base_url = '/switchmanager/%(container_name)s'
 
     def get_nodes(self, container_name):
-        """Get node informations
+        """Get node information
 
         URL:
             {Base URL}/nodes
@@ -138,7 +138,7 @@ class HostTrackerAPIClient(_Base):
     base_url = '/hosttracker/%(container_name)s'
 
     def get_active_hosts(self, container_name):
-        """Get active hosts informatinos
+        """Get active hosts information
 
         URL:
             {Base URL}/hosts/active
@@ -146,7 +146,7 @@ class HostTrackerAPIClient(_Base):
         return self.request('/hosts/active', container_name)
 
     def get_inactive_hosts(self, container_name):
-        """Get inactive hosts informations
+        """Get inactive hosts information
 
         URL:
             {Base URL}/hosts/inactive
@@ -227,7 +227,7 @@ class Client(object):
         resp = requests.get(url, **self._req_params)
         if CONF.debug:
             self._log_res(resp)
-        if resp.status_code / 100 != 2:
+        if resp.status_code // 100 != 2:
             raise OpenDaylightRESTAPIFailed(
                 _('OpenDaylitght API returned %(status)s %(reason)s') %
                 {'status': resp.status_code, 'reason': resp.reason})

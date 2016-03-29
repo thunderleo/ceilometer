@@ -13,13 +13,12 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-from oslo_config import cfg
-
 from ceilometer.agent import plugin_base
 from ceilometer import neutron_client
 
 
 class _BaseServicesDiscovery(plugin_base.DiscoveryBase):
+    KEYSTONE_REQUIRED_FOR_SERVICE = 'neutron'
 
     def __init__(self):
         super(_BaseServicesDiscovery, self).__init__()
@@ -27,7 +26,6 @@ class _BaseServicesDiscovery(plugin_base.DiscoveryBase):
 
 
 class LBPoolsDiscovery(_BaseServicesDiscovery):
-    @plugin_base.check_keystone(cfg.CONF.service_types.neutron)
     def discover(self, manager, param=None):
         """Discover resources to monitor."""
 
@@ -37,7 +35,6 @@ class LBPoolsDiscovery(_BaseServicesDiscovery):
 
 
 class LBVipsDiscovery(_BaseServicesDiscovery):
-    @plugin_base.check_keystone(cfg.CONF.service_types.neutron)
     def discover(self, manager, param=None):
         """Discover resources to monitor."""
 
@@ -47,7 +44,6 @@ class LBVipsDiscovery(_BaseServicesDiscovery):
 
 
 class LBMembersDiscovery(_BaseServicesDiscovery):
-    @plugin_base.check_keystone(cfg.CONF.service_types.neutron)
     def discover(self, manager, param=None):
         """Discover resources to monitor."""
 
@@ -56,8 +52,25 @@ class LBMembersDiscovery(_BaseServicesDiscovery):
                 if i.get('status', None) != 'error']
 
 
+class LBListenersDiscovery(_BaseServicesDiscovery):
+    def discover(self, manager, param=None):
+        """Discover load balancer listener resources to monitor."""
+
+        listeners = self.neutron_cli.list_listener()
+        return [i for i in listeners
+                if i.get('operating_status', None) != 'error']
+
+
+class LBLoadBalancersDiscovery(_BaseServicesDiscovery):
+    def discover(self, manager, param=None):
+        """Discover load balancer resources to monitor."""
+
+        loadbalancers = self.neutron_cli.list_loadbalancer()
+        return [i for i in loadbalancers
+                if i.get('operating_status', None) != 'error']
+
+
 class LBHealthMonitorsDiscovery(_BaseServicesDiscovery):
-    @plugin_base.check_keystone(cfg.CONF.service_types.neutron)
     def discover(self, manager, param=None):
         """Discover resources to monitor."""
 
@@ -66,7 +79,6 @@ class LBHealthMonitorsDiscovery(_BaseServicesDiscovery):
 
 
 class VPNServicesDiscovery(_BaseServicesDiscovery):
-    @plugin_base.check_keystone(cfg.CONF.service_types.neutron)
     def discover(self, manager, param=None):
         """Discover resources to monitor."""
 
@@ -76,7 +88,6 @@ class VPNServicesDiscovery(_BaseServicesDiscovery):
 
 
 class IPSecConnectionsDiscovery(_BaseServicesDiscovery):
-    @plugin_base.check_keystone(cfg.CONF.service_types.neutron)
     def discover(self, manager, param=None):
         """Discover resources to monitor."""
 
@@ -85,7 +96,6 @@ class IPSecConnectionsDiscovery(_BaseServicesDiscovery):
 
 
 class FirewallDiscovery(_BaseServicesDiscovery):
-    @plugin_base.check_keystone(cfg.CONF.service_types.neutron)
     def discover(self, manager, param=None):
         """Discover resources to monitor."""
 
@@ -95,7 +105,6 @@ class FirewallDiscovery(_BaseServicesDiscovery):
 
 
 class FirewallPolicyDiscovery(_BaseServicesDiscovery):
-    @plugin_base.check_keystone(cfg.CONF.service_types.neutron)
     def discover(self, manager, param=None):
         """Discover resources to monitor."""
 

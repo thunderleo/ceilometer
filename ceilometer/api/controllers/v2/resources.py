@@ -19,6 +19,7 @@
 # under the License.
 
 import datetime
+import urllib
 
 import pecan
 from pecan import rest
@@ -120,6 +121,10 @@ class ResourcesController(rest.RestController):
         """
 
         rbac.enforce('get_resource', pecan.request)
+        # In case we have special character in resource id, for example, swift
+        # can generate samples with resource id like
+        # 29f809d9-88bb-4c40-b1ba-a77a1fcf8ceb/glance
+        resource_id = urllib.unquote(resource_id)
 
         authorized_project = rbac.get_limited_to_project(pecan.request.headers)
         resources = list(pecan.request.storage_conn.get_resources(
@@ -129,8 +134,8 @@ class ResourcesController(rest.RestController):
         return Resource.from_db_and_links(resources[0],
                                           self._resource_links(resource_id))
 
-    @wsme_pecan.wsexpose([Resource], [base.Query], int)
-    def get_all(self, q=None, meter_links=1):
+    @wsme_pecan.wsexpose([Resource], [base.Query], int, int)
+    def get_all(self, q=None, limit=None, meter_links=1):
         """Retrieve definitions of all of the resources.
 
         :param q: Filter rules for the resources to be returned.
@@ -140,11 +145,13 @@ class ResourcesController(rest.RestController):
         rbac.enforce('get_resources', pecan.request)
 
         q = q or []
+        limit = utils.enforce_limit(limit)
         kwargs = utils.query_to_kwargs(
-            q, pecan.request.storage_conn.get_resources)
+            q, pecan.request.storage_conn.get_resources, ['limit'])
         resources = [
             Resource.from_db_and_links(r,
                                        self._resource_links(r.resource_id,
                                                             meter_links))
-            for r in pecan.request.storage_conn.get_resources(**kwargs)]
+            for r in pecan.request.storage_conn.get_resources(limit=limit,
+                                                              **kwargs)]
         return resources

@@ -22,11 +22,11 @@ from ceilometer import sample
 cfg.CONF.import_opt('nova_control_exchange',
                     'ceilometer.compute.notifications')
 cfg.CONF.import_opt('glance_control_exchange',
-                    'ceilometer.image.notifications')
+                    'ceilometer.notification')
 cfg.CONF.import_opt('neutron_control_exchange',
                     'ceilometer.network.notifications')
 cfg.CONF.import_opt('cinder_control_exchange',
-                    'ceilometer.volume.notifications')
+                    'ceilometer.notification')
 
 OPTS = [
     cfg.MultiStrOpt('http_control_exchanges',
@@ -44,15 +44,14 @@ class HTTPRequest(plugin_base.NotificationBase,
                   plugin_base.NonMetricNotificationBase):
     event_types = ['http.request']
 
-    @staticmethod
-    def get_targets(conf):
+    def get_targets(self, conf):
         """Return a sequence of oslo_messaging.Target
 
         This sequence is defining the exchange and topics to be connected for
         this plugin.
         """
         return [oslo_messaging.Target(topic=topic, exchange=exchange)
-                for topic in conf.notification_topics
+                for topic in self.get_notification_topics(conf)
                 for exchange in conf.http_control_exchanges]
 
     def process_notification(self, message):

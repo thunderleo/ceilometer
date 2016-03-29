@@ -22,6 +22,7 @@ from oslo_config import cfg
 from oslo_utils import timeutils
 
 from ceilometer.agent import plugin_base
+from ceilometer import keystone_client
 from ceilometer import sample
 
 
@@ -30,7 +31,7 @@ OPTS = [
                default=0,
                help="Number of items to request in "
                     "each paginated Glance API request "
-                    "(parameter used by glancecelient). "
+                    "(parameter used by glanceclient). "
                     "If this is less than or equal to 0, "
                     "page size is not specified "
                     "(default value in glanceclient is used)."),
@@ -55,12 +56,10 @@ class _Base(plugin_base.PollsterBase):
     @staticmethod
     def get_glance_client(ksclient, endpoint):
         # hard-code v1 glance API version selection while v2 API matures
-        service_credentials = cfg.CONF.service_credentials
-        return glanceclient.Client('1', endpoint,
-                                   token=ksclient.auth_token,
-                                   cacert=service_credentials.os_cacert,
-                                   insecure=service_credentials.insecure,
-                                   timeout=cfg.CONF.http_timeout)
+        return glanceclient.Client('1',
+                                   session=keystone_client.get_session(),
+                                   endpoint=endpoint,
+                                   auth=ksclient.session.auth)
 
     def _get_images(self, ksclient, endpoint):
         client = self.get_glance_client(ksclient, endpoint)
@@ -111,7 +110,7 @@ class ImagePollster(_Base):
                     user_id=None,
                     project_id=image.owner,
                     resource_id=image.id,
-                    timestamp=timeutils.isotime(),
+                    timestamp=timeutils.utcnow().isoformat(),
                     resource_metadata=self.extract_image_metadata(image),
                 )
 
@@ -128,6 +127,6 @@ class ImageSizePollster(_Base):
                     user_id=None,
                     project_id=image.owner,
                     resource_id=image.id,
-                    timestamp=timeutils.isotime(),
+                    timestamp=timeutils.utcnow().isoformat(),
                     resource_metadata=self.extract_image_metadata(image),
                 )

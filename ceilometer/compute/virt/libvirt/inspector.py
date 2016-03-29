@@ -48,10 +48,11 @@ def retry_on_disconnect(function):
         try:
             return function(self, *args, **kwargs)
         except libvirt.libvirtError as e:
-            if (e.get_error_code() == libvirt.VIR_ERR_SYSTEM_ERROR and
+            if (e.get_error_code() in (libvirt.VIR_ERR_SYSTEM_ERROR,
+                                       libvirt.VIR_ERR_INTERNAL_ERROR) and
                 e.get_error_domain() in (libvirt.VIR_FROM_REMOTE,
                                          libvirt.VIR_FROM_RPC)):
-                LOG.debug(_('Connection to libvirt broken'))
+                LOG.debug('Connection to libvirt broken')
                 self.connection = None
                 return function(self, *args, **kwargs)
             else:
@@ -76,10 +77,14 @@ class LibvirtInspector(virt_inspector.Inspector):
             global libvirt
             if libvirt is None:
                 libvirt = __import__('libvirt')
-            LOG.debug(_('Connecting to libvirt: %s'), self.uri)
+            LOG.debug('Connecting to libvirt: %s', self.uri)
             self.connection = libvirt.openReadOnly(self.uri)
 
         return self.connection
+
+    def check_sanity(self):
+        if not self._get_connection():
+            raise virt_inspector.NoSanityException()
 
     @retry_on_disconnect
     def _lookup_by_uuid(self, instance):
@@ -90,7 +95,8 @@ class LibvirtInspector(virt_inspector.Inspector):
             if not libvirt or not isinstance(ex, libvirt.libvirtError):
                 raise virt_inspector.InspectorException(six.text_type(ex))
             error_code = ex.get_error_code()
-            if (error_code == libvirt.VIR_ERR_SYSTEM_ERROR and
+            if (error_code in (libvirt.VIR_ERR_SYSTEM_ERROR,
+                               libvirt.VIR_ERR_INTERNAL_ERROR) and
                 ex.get_error_domain() in (libvirt.VIR_FROM_REMOTE,
                                           libvirt.VIR_FROM_RPC)):
                 raise
@@ -104,7 +110,7 @@ class LibvirtInspector(virt_inspector.Inspector):
             raise virt_inspector.InstanceNotFoundException(msg)
 
     def inspect_cpus(self, instance):
-        domain = self._lookup_by_uuid(instance)
+        domain = self._get_domain_not_shut_off_or_raise(instance)
         dom_info = domain.info()
         return virt_inspector.CPUStats(number=dom_info[3], time=dom_info[4])
 

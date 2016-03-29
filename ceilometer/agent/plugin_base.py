@@ -18,68 +18,19 @@
 import abc
 import collections
 
-from keystoneclient.v2_0 import client as ksclient
-from oslo_config import cfg
 from oslo_context import context
 from oslo_log import log
 import oslo_messaging
 import six
+from stevedore import extension
 
-from ceilometer.i18n import _
+from ceilometer.i18n import _LE
 from ceilometer import messaging
-
-cfg.CONF.import_group('service_credentials', 'ceilometer.service')
 
 LOG = log.getLogger(__name__)
 
 ExchangeTopics = collections.namedtuple('ExchangeTopics',
                                         ['exchange', 'topics'])
-
-
-def _get_keystone():
-    try:
-        return ksclient.Client(
-            username=cfg.CONF.service_credentials.os_username,
-            password=cfg.CONF.service_credentials.os_password,
-            tenant_id=cfg.CONF.service_credentials.os_tenant_id,
-            tenant_name=cfg.CONF.service_credentials.os_tenant_name,
-            cacert=cfg.CONF.service_credentials.os_cacert,
-            auth_url=cfg.CONF.service_credentials.os_auth_url,
-            region_name=cfg.CONF.service_credentials.os_region_name,
-            insecure=cfg.CONF.service_credentials.insecure)
-    except Exception as e:
-        return e
-
-
-def check_keystone(service_type=None):
-    """Decorator function to check if manager has valid keystone client.
-
-       Also checks if the service is registered/enabled in Keystone.
-
-       :param service_type: name of service in Keystone
-    """
-    def wrapped(f):
-        def func(self, *args, **kwargs):
-            manager = kwargs.get('manager')
-            if not manager and len(args) > 0:
-                manager = args[0]
-            keystone = getattr(manager, 'keystone', None)
-            if not keystone:
-                keystone = _get_keystone()
-            if isinstance(keystone, Exception):
-                LOG.error(_('Skip due to keystone error %s'),
-                          keystone if keystone else '')
-                return iter([])
-            elif service_type:
-                endpoints = keystone.service_catalog.get_endpoints(
-                    service_type=service_type)
-                if not endpoints:
-                    LOG.warning(_('Skipping because %s service is not '
-                                  'registered in keystone') % service_type)
-                    return iter([])
-            return f(self, *args, **kwargs)
-        return func
-    return wrapped
 
 
 class PluginBase(object):
@@ -93,10 +44,16 @@ class NotificationBase(PluginBase):
         super(NotificationBase, self).__init__()
         # NOTE(gordc): this is filter rule used by oslo.messaging to dispatch
         # messages to an endpoint.
-        if self.event_types is not None:
+        if self.event_types:
             self.filter_rule = oslo_messaging.NotificationFilter(
                 event_type='|'.join(self.event_types))
         self.manager = manager
+
+    @staticmethod
+    def get_notification_topics(conf):
+        if 'notification_topics' in conf:
+            return conf.notification_topics
+        return conf.oslo_messaging_notifications.topics
 
     @abc.abstractproperty
     def event_types(self):
@@ -121,22 +78,35 @@ class NotificationBase(PluginBase):
         :param message: Message to process.
         """
 
-    def info(self, ctxt, publisher_id, event_type, payload, metadata):
-        """RPC endpoint for notification messages
+    def info(self, notifications):
+        """RPC endpoint for notification messages at info level
 
         When another service sends a notification over the message
         bus, this method receives it.
 
-        :param ctxt: oslo.messaging context
-        :param publisher_id: publisher of the notification
-        :param event_type: type of notification
-        :param payload: notification payload
-        :param metadata: metadata about the notification
-
+        :param notifications: list of notifications
         """
-        notification = messaging.convert_to_old_notification_format(
-            'info', ctxt, publisher_id, event_type, payload, metadata)
-        self.to_samples_and_publish(context.get_admin_context(), notification)
+        self._process_notifications('info', notifications)
+
+    def sample(self, notifications):
+        """RPC endpoint for notification messages at sample level
+
+        When another service sends a notification over the message
+        bus at sample priority, this method receives it.
+
+        :param notifications: list of notifications
+        """
+        self._process_notifications('sample', notifications)
+
+    def _process_notifications(self, priority, notifications):
+        for notification in notifications:
+            try:
+                notification = messaging.convert_to_old_notification_format(
+                    priority, notification)
+                self.to_samples_and_publish(context.get_admin_context(),
+                                            notification)
+            except Exception:
+                LOG.error(_LE('Fail to process notification'), exc_info=True)
 
     def to_samples_and_publish(self, context, notification):
         """Return samples produced by *process_notification*.
@@ -170,7 +140,7 @@ class ExtensionLoadError(Exception):
 
 
 class PollsterPermanentError(Exception):
-    """Permenant error when polling.
+    """Permanent error when polling.
 
     When unrecoverable error happened in polling, pollster can raise this
     exception with failed resource to prevent itself from polling any more.
@@ -178,8 +148,8 @@ class PollsterPermanentError(Exception):
     error.
     """
 
-    def __init__(self, resource):
-        self.fail_res = resource
+    def __init__(self, resources):
+        self.fail_res_list = resources
 
 
 @six.add_metaclass(abc.ABCMeta)
@@ -232,9 +202,39 @@ class PollsterBase(PluginBase):
 
         """
 
+    @classmethod
+    def build_pollsters(cls):
+        """Return a list of tuple (name, pollster).
+
+        The name is the meter name which the pollster would return, the
+        pollster is a pollster object instance. The pollster which implements
+        this method should be registered in the namespace of
+        ceilometer.builder.xxx instead of ceilometer.poll.xxx.
+        """
+        return []
+
+    @classmethod
+    def get_pollsters_extensions(cls):
+        """Return a list of stevedore extensions.
+
+        The returned stevedore extensions wrap the pollster object instances
+        returned by build_pollsters.
+        """
+        extensions = []
+        try:
+            for name, pollster in cls.build_pollsters():
+                ext = extension.Extension(name, None, cls, pollster)
+                extensions.append(ext)
+        except Exception as err:
+            raise ExtensionLoadError(err)
+        return extensions
+
 
 @six.add_metaclass(abc.ABCMeta)
 class DiscoveryBase(object):
+    KEYSTONE_REQUIRED_FOR_SERVICE = None
+    """Service type required in keystone catalog to works"""
+
     @abc.abstractmethod
     def discover(self, manager, param=None):
         """Discover resources to monitor.

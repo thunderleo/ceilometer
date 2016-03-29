@@ -19,7 +19,7 @@ from oslo_log import log
 import requests
 
 from ceilometer import dispatcher
-from ceilometer.i18n import _, _LE
+from ceilometer.i18n import _, _LE, _LW
 from ceilometer.publisher import utils as publisher_utils
 
 LOG = log.getLogger(__name__)
@@ -34,10 +34,6 @@ http_dispatcher_opts = [
                help='The target for event data where the http request '
                     'will be sent to. If this is not set, it will default '
                     'to same as Sample target.'),
-    cfg.BoolOpt('cadf_only',
-                default=False,
-                help='The flag that indicates if only cadf message should '
-                     'be posted. If false, all meters will be posted.'),
     cfg.IntOpt('timeout',
                default=5,
                help='The max time in seconds to wait for a request to '
@@ -47,23 +43,25 @@ http_dispatcher_opts = [
 cfg.CONF.register_opts(http_dispatcher_opts, group="dispatcher_http")
 
 
-class HttpDispatcher(dispatcher.Base):
-    """Dispatcher class for posting metering data into a http target.
+class HttpDispatcher(dispatcher.MeterDispatcherBase,
+                     dispatcher.EventDispatcherBase):
+    """Dispatcher class for posting metering/event data into a http target.
 
     To enable this dispatcher, the following option needs to be present in
     ceilometer.conf file::
 
         [DEFAULT]
-        dispatcher = http
+        meter_dispatchers = http
+        event_dispatchers = http
 
     Dispatcher specific options can be added as follows::
 
         [dispatcher_http]
         target = www.example.com
         event_target = www.example.com
-        cadf_only = true
         timeout = 2
     """
+
     def __init__(self, conf):
         super(HttpDispatcher, self).__init__(conf)
         self.headers = {'Content-type': 'application/json'}
@@ -71,7 +69,6 @@ class HttpDispatcher(dispatcher.Base):
         self.target = self.conf.dispatcher_http.target
         self.event_target = (self.conf.dispatcher_http.event_target or
                              self.target)
-        self.cadf_only = self.conf.dispatcher_http.cadf_only
 
     def record_metering_data(self, data):
         if self.target == '':
@@ -86,33 +83,23 @@ class HttpDispatcher(dispatcher.Base):
             data = [data]
 
         for meter in data:
-            LOG.debug(_(
+            LOG.debug(
                 'metering data %(counter_name)s '
-                'for %(resource_id)s @ %(timestamp)s: %(counter_volume)s')
-                % ({'counter_name': meter['counter_name'],
-                    'resource_id': meter['resource_id'],
-                    'timestamp': meter.get('timestamp', 'NO TIMESTAMP'),
-                    'counter_volume': meter['counter_volume']}))
+                'for %(resource_id)s @ %(timestamp)s: %(counter_volume)s',
+                {'counter_name': meter['counter_name'],
+                 'resource_id': meter['resource_id'],
+                 'timestamp': meter.get('timestamp', 'NO TIMESTAMP'),
+                 'counter_volume': meter['counter_volume']})
             if publisher_utils.verify_signature(
                     meter, self.conf.publisher.telemetry_secret):
                 try:
-                    if self.cadf_only:
-                        # Only cadf messages are being wanted.
-                        req_data = meter.get('resource_metadata',
-                                             {}).get('request')
-                        if req_data and 'CADF_EVENT' in req_data:
-                            data = req_data['CADF_EVENT']
-                        else:
-                            continue
-                    else:
-                        # Every meter should be posted to the target
-                        data = meter
+                    # Every meter should be posted to the target
                     res = requests.post(self.target,
-                                        data=json.dumps(data),
+                                        data=json.dumps(meter),
                                         headers=self.headers,
                                         timeout=self.timeout)
-                    LOG.debug(_('Message posting finished with status code '
-                                '%d.') % res.status_code)
+                    LOG.debug('Message posting finished with status code '
+                              '%d.', res.status_code)
                 except Exception as err:
                     LOG.exception(_('Failed to record metering data: %s'),
                                   err)
@@ -126,13 +113,19 @@ class HttpDispatcher(dispatcher.Base):
             events = [events]
 
         for event in events:
-            res = None
-            try:
-                res = requests.post(self.event_target, data=event,
-                                    headers=self.headers, timeout=self.timeout)
-                res.raise_for_status()
-            except Exception:
-                error_code = res.status_code if res else 'unknown'
-                LOG.exception(_LE('Status Code: %{code}s. Failed to dispatch '
-                                  'event: %{event}s'),
-                              {'code': error_code, 'event': event})
+            if publisher_utils.verify_signature(
+                    event, self.conf.publisher.telemetry_secret):
+                res = None
+                try:
+                    res = requests.post(self.event_target, data=event,
+                                        headers=self.headers,
+                                        timeout=self.timeout)
+                    res.raise_for_status()
+                except Exception:
+                    error_code = res.status_code if res else 'unknown'
+                    LOG.exception(_LE('Status Code: %{code}s. Failed to'
+                                      'dispatch event: %{event}s'),
+                                  {'code': error_code, 'event': event})
+            else:
+                LOG.warning(_LW(
+                    'event signature invalid, discarding event: %s'), event)

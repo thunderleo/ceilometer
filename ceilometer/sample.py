@@ -32,7 +32,6 @@ from oslo_config import cfg
 OPTS = [
     cfg.StrOpt('sample_source',
                default='openstack',
-               deprecated_name='counter_source',
                help='Source for samples emitted on this instance.'),
 ]
 
@@ -82,10 +81,13 @@ class Sample(object):
     @classmethod
     def from_notification(cls, name, type, volume, unit,
                           user_id, project_id, resource_id,
-                          message, source=None):
-        metadata = copy.copy(message['payload'])
-        metadata['event_type'] = message['event_type']
-        metadata['host'] = message['publisher_id']
+                          message, timestamp=None, metadata=None, source=None):
+        if not metadata:
+            metadata = (copy.copy(message['payload'])
+                        if isinstance(message['payload'], dict) else {})
+            metadata['event_type'] = message['event_type']
+            metadata['host'] = message['publisher_id']
+        ts = timestamp if timestamp else message['timestamp']
         return cls(name=name,
                    type=type,
                    volume=volume,
@@ -93,7 +95,7 @@ class Sample(object):
                    user_id=user_id,
                    project_id=project_id,
                    resource_id=resource_id,
-                   timestamp=message['timestamp'],
+                   timestamp=ts,
                    resource_metadata=metadata,
                    source=source)
 

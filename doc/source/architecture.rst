@@ -25,18 +25,32 @@ High-Level Architecture
    An overall summary of Ceilometer's logical architecture.
 
 Each of Ceilometer's services are designed to scale horizontally. Additional
-workers and nodes can be added depending on the expected load. Ceilometer offers
-five core services, the data agents designed to work independently from
-collection and alarming, but also designed to work together as a
-complete solution:
+workers and nodes can be added depending on the expected load. Ceilometer
+offers three core services, the data agents designed to work independently from
+collection, but also designed to work together as a complete solution:
 
 1. polling agent - daemon designed to poll OpenStack services and build Meters.
-2. notification agent - daemon designed to listen to notifications on message queue
-   and convert them to Events and Samples.
-3. collector - daemon designed to gather and record event and metering data
-   created by notification and polling agents.
-4. api - service to query and view data recorded by collector service.
-5. alarming - daemons to evaluate and notify based on defined alarming rules.
+2. notification agent - daemon designed to listen to notifications on message queue,
+   convert them to Events and Samples, and apply pipeline actions.
+3. (optional) collector - daemon designed to gather and record event and metering data
+   created by notification and polling agents (if using Gnocchi or full-fidelity storage).
+4. (optional) api - service to query and view data recorded by collector
+   in internal full-fidelity database (if enabled).
+
+As Ceilometer has grown to capture more data, it became apparent that data
+storage would need to be optimised. To address this, Gnocchi_ (resource metering
+as a service) was developed to capture the data in a time series database to
+optimise storage and querying. Gnocchi is intended to replace the existing
+metering database interface.
+
+.. _Gnocchi: http://docs.openstack.org/developer/gnocchi/
+
+.. figure:: ./ceilo-gnocchi-arch.png
+   :width: 100%
+   :align: center
+   :alt: Ceilometer+Gnocchi Architecture summary
+
+   An overall summary of Ceilometer+Gnocchi's logical architecture.
 
 
 Gathering the data
@@ -82,10 +96,17 @@ Notification Agents: Listening for data
 .. index::
       double: notifications; architecture
 
+.. figure:: ./2-1-collection-notification.png
+   :width: 100%
+   :align: center
+   :alt: Notification agents
+
+   Notification agents consuming messages from services.
+
 The heart of the system is the notification daemon (agent-notification)
 which monitors the message bus for data being provided by other
 OpenStack components such as Nova, Glance, Cinder, Neutron, Swift, Keystone,
-and Heat.
+and Heat, as well as Ceilometer internal communication.
 
 The notification daemon loads one or more *listener* plugins, using the
 namespace ``ceilometer.notification``. Each plugin can listen to any topics,
@@ -115,6 +136,13 @@ Polling Agents: Asking for data
 .. index::
       double: polling; architecture
 
+.. figure:: ./2-2-collection-poll.png
+   :width: 100%
+   :align: center
+   :alt: Polling agents
+
+   Polling agents querying services for data.
+
 Polling for compute resources is handled by a polling agent running
 on the compute node (where communication with the hypervisor is more
 efficient), often referred to as the compute-agent. Polling via
@@ -137,6 +165,8 @@ Please notice that there's an optional config called
 setting an integer greater than zero to shuffle agents to start polling task,
 so as to add some random jitter to the time of sending requests to nova
 or other components to avoid large number of requests in short time.
+Additionally, there is an option to stream samples to minimise latency (at the
+expense of load) by setting ``batch_polled_samples`` to ``False`` in ceilometer.conf.
 
 
 Processing the data
@@ -155,7 +185,8 @@ Pipeline Manager
    The assembly of components making the Ceilometer pipeline.
 
 Ceilometer offers the ability to take data gathered by the agents, manipulate
-it, and publish it in various combinations via multiple pipelines.
+it, and publish it in various combinations via multiple pipelines. This
+functionality is handled by the notification agents.
 
 Transforming the data
 ---------------------
@@ -185,10 +216,9 @@ Publishing the data
 
 Currently, processed data can be published using 4 different transports:
 notifier, a notification based publisher which pushes samples to a message
-queue which can be consumed by the collector or an external system; rpc, a
-relatively secure, synchronous RPC based publisher; udp, which publishes
-samples using UDP packets; and kafka, which publishes data to a Kafka message
-queue to be consumed by any system that supports Kafka.
+queue which can be consumed by the collector or an external system; udp, which
+publishes samples using UDP packets; and kafka, which publishes data to a Kafka
+message queue to be consumed by any system that supports Kafka.
 
 
 Storing the data
@@ -226,11 +256,23 @@ divide the data into their own databases, tailored for its purpose. For
 example, a deployer could choose to store alarms in an SQL backend while
 storing events and metering data in a NoSQL backend.
 
+Ceilometer's storage service is designed to handle use cases where full-fidelity
+of the data is required (e.g. auditing). To handle responsive, long-term data
+queries, solutions that strip away some of the data's resolution, such as
+Gnocchi, are recommended.
+
+.. note::
+
+   As of Liberty, alarming support, and subsequently its database, is handled
+   by Aodh_.
+
 .. note::
 
    We do not guarantee that we won't change the DB schema, so it is
    highly recommended to access the database through the API and not use
    direct queries.
+
+.. _Aodh: http://docs.openstack.org/developer/aodh/
 
 
 Accessing the data
@@ -239,7 +281,7 @@ Accessing the data
 API Service
 -----------
 
-If the collected data from polling and notification agents are stored in supported
+If the collected data from polling and notification agents are stored in Ceilometer's
 database(s) (see the section :ref:`which-db`), it is possible that the schema of
 these database(s) may evolve over time. For this reasons, we offer a REST API
 and recommend that you access the collected data via the API rather than by
@@ -270,43 +312,6 @@ layer, and use the same tools for metering your entire cloud.
 
 Moreover, end users can also
 :ref:`send their own application specific data <user-defined-data>` into the
-database through the REST API for a various set of use cases (see the section
-"Alarming" later in this article).
+database through the REST API for a various set of use cases.
 
 .. _send their own application centric data: ./webapi/v2.html#user-defined-data
-
-
-Evaluating the data
-===================
-
-Alarming Service
-----------------
-
-The alarming component of Ceilometer, first delivered in the Havana
-version, allows you to set alarms based on threshold evaluation for a
-collection of samples. An alarm can be set on a single meter, or on a
-combination. For example, you may want to trigger an alarm when the memory
-consumption reaches 70% on a given instance if the instance has been up for
-more than 10 min. To setup an alarm, you will call
-:ref:`Ceilometer's API server <alarms-api>` specifying the alarm conditions and
-an action to take.
-
-Of course, if you are not administrator of the cloud itself, you can only set
-alarms on meters for your own components. You can also
-:ref:`send your own meters <user-defined-data>` from within your instances,
-meaning that you can trigger alarms based on application centric data.
-
-There can be multiple form of actions, but two have been implemented so far:
-
-1. :term:`HTTP callback`: you provide a URL to be called whenever the alarm has
-   been set off. The payload of the request contains all the details of why the
-   alarm was triggered.
-2. :term:`log`: mostly useful for debugging, stores alarms in a log file.
-
-For more details on this, we recommend that you read the blog post by
-Mehdi Abaakouk `Autoscaling with Heat and Ceilometer`_. Particular attention
-should be given to the section "Some notes about deploying alarming" as the
-database setup (using a separate database from the one used for metering)
-will be critical in all cases of production deployment.
-
-.. _Autoscaling with Heat and Ceilometer: http://techs.enovance.com/5991/autoscaling-with-heat-and-ceilometer

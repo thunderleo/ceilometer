@@ -14,6 +14,7 @@
 
 from oslo_config import cfg
 from oslo_log import log
+from oslo_utils import timeutils
 
 from ceilometer.agent import plugin_base
 from ceilometer.i18n import _
@@ -41,17 +42,37 @@ class NodesDiscoveryTripleO(plugin_base.DiscoveryBase):
     def __init__(self):
         super(NodesDiscoveryTripleO, self).__init__()
         self.nova_cli = nova_client.Client()
+        self.last_run = None
+        self.instances = {}
 
     @staticmethod
     def _address(instance, field):
         return instance.addresses['ctlplane'][0].get(field)
 
     def discover(self, manager, param=None):
-        """Discover resources to monitor."""
+        """Discover resources to monitor.
 
-        instances = self.nova_cli.instance_get_all()
-        resources = []
+        instance_get_all will return all instances if last_run is None,
+        and will return only the instances changed since the last_run time.
+        """
+        try:
+            instances = self.nova_cli.instance_get_all(self.last_run)
+        except Exception:
+            # NOTE(zqfan): instance_get_all is wrapped and will log exception
+            # when there is any error. It is no need to raise it again and
+            # print one more time.
+            return []
+
         for instance in instances:
+            if getattr(instance, 'OS-EXT-STS:vm_state', None) in ['deleted',
+                                                                  'error']:
+                self.instances.pop(instance.id, None)
+            else:
+                self.instances[instance.id] = instance
+        self.last_run = timeutils.utcnow(True).isoformat()
+
+        resources = []
+        for instance in self.instances.values():
             try:
                 ip_address = self._address(instance, 'addr')
                 final_address = (

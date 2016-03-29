@@ -30,6 +30,7 @@ import wsmeext.pecan as wsme_pecan
 
 from ceilometer.api.controllers.v2 import base
 from ceilometer.api.controllers.v2 import utils as v2_utils
+from ceilometer.api import rbac
 from ceilometer.event.storage import models as event_models
 from ceilometer.i18n import _
 from ceilometer import storage
@@ -156,6 +157,21 @@ class Event(base.Base):
         )
 
 
+def _build_rbac_query_filters():
+    filters = {'t_filter': [], 'admin_proj': None}
+    # Returns user_id, proj_id for non-admins
+    user_id, proj_id = rbac.get_limited_to(pecan.request.headers)
+    # If non-admin, filter events by user and project
+    if user_id and proj_id:
+        filters['t_filter'].append({"key": "project_id", "string": proj_id,
+                                    "op": "eq"})
+        filters['t_filter'].append({"key": "user_id", "string": user_id,
+                                    "op": "eq"})
+    elif not user_id and not proj_id:
+        filters['admin_proj'] = pecan.request.headers.get('X-Project-Id')
+    return filters
+
+
 def _event_query_to_event_filter(q):
     evt_model_filter = {
         'event_type': None,
@@ -163,24 +179,33 @@ def _event_query_to_event_filter(q):
         'start_timestamp': None,
         'end_timestamp': None
     }
-    traits_filter = []
+    filters = _build_rbac_query_filters()
+    traits_filter = filters['t_filter']
+    admin_proj = filters['admin_proj']
 
     for i in q:
         if not i.op:
             i.op = 'eq'
         elif i.op not in base.operation_kind:
-            error = (_('operator %(operator)s is not supported. the supported'
+            error = (_('Operator %(operator)s is not supported. The supported'
                        ' operators are: %(supported)s') %
                      {'operator': i.op, 'supported': base.operation_kind})
             raise base.ClientSideError(error)
         if i.field in evt_model_filter:
+            if i.op != 'eq':
+                error = (_('Operator %(operator)s is not supported. Only'
+                           ' equality operator is available for field'
+                           ' %(field)s') %
+                         {'operator': i.op, 'field': i.field})
+                raise base.ClientSideError(error)
             evt_model_filter[i.field] = i.value
         else:
             trait_type = i.type or 'string'
             traits_filter.append({"key": i.field,
                                   trait_type: i._get_value_as_type(),
                                   "op": i.op})
-    return storage.EventFilter(traits_filter=traits_filter, **evt_model_filter)
+    return storage.EventFilter(traits_filter=traits_filter,
+                               admin_proj=admin_proj, **evt_model_filter)
 
 
 class TraitsController(rest.RestController):
@@ -194,7 +219,7 @@ class TraitsController(rest.RestController):
         :param event_type: Event type to filter traits by
         :param trait_name: Trait to return values for
         """
-        LOG.debug(_("Getting traits for %s") % event_type)
+        LOG.debug("Getting traits for %s", event_type)
         return [Trait._convert_storage_trait(t)
                 for t in pecan.request.event_storage_conn
                 .get_traits(event_type, trait_name)]
@@ -237,14 +262,17 @@ class EventTypesController(rest.RestController):
 class EventsController(rest.RestController):
     """Works on Events."""
 
-    @v2_utils.requires_admin
-    @wsme_pecan.wsexpose([Event], [EventQuery])
-    def get_all(self, q=None):
+    @v2_utils.requires_context
+    @wsme_pecan.wsexpose([Event], [EventQuery], int)
+    def get_all(self, q=None, limit=None):
         """Return all events matching the query filters.
 
         :param q: Filter arguments for which Events to return
+        :param limit: Maximum number of samples to be returned.
         """
+        rbac.enforce("events:index", pecan.request)
         q = q or []
+        limit = v2_utils.enforce_limit(limit)
         event_filter = _event_query_to_event_filter(q)
         return [Event(message_id=event.message_id,
                       event_type=event.event_type,
@@ -252,16 +280,23 @@ class EventsController(rest.RestController):
                       traits=event.traits,
                       raw=event.raw)
                 for event in
-                pecan.request.event_storage_conn.get_events(event_filter)]
+                pecan.request.event_storage_conn.get_events(event_filter,
+                                                            limit)]
 
-    @v2_utils.requires_admin
+    @v2_utils.requires_context
     @wsme_pecan.wsexpose(Event, wtypes.text)
     def get_one(self, message_id):
         """Return a single event with the given message id.
 
         :param message_id: Message ID of the Event to be returned
         """
-        event_filter = storage.EventFilter(message_id=message_id)
+        rbac.enforce("events:show", pecan.request)
+        filters = _build_rbac_query_filters()
+        t_filter = filters['t_filter']
+        admin_proj = filters['admin_proj']
+        event_filter = storage.EventFilter(traits_filter=t_filter,
+                                           admin_proj=admin_proj,
+                                           message_id=message_id)
         events = [event for event
                   in pecan.request.event_storage_conn.get_events(event_filter)]
         if not events:

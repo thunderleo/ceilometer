@@ -181,12 +181,12 @@ class Statistics(base.Base):
                 self.duration_start and
                 self.duration_start < start_timestamp):
             self.duration_start = start_timestamp
-            LOG.debug(_('clamping min timestamp to range'))
+            LOG.debug('clamping min timestamp to range')
         if (end_timestamp and
                 self.duration_end and
                 self.duration_end > end_timestamp):
             self.duration_end = end_timestamp
-            LOG.debug(_('clamping max timestamp to range'))
+            LOG.debug('clamping max timestamp to range')
 
         # If we got valid timestamps back, compute a duration in seconds.
         #
@@ -367,7 +367,8 @@ class MeterController(rest.RestController):
                                           tenant=def_project_id,
                                           is_admin=True)
             notifier = pecan.request.notifier
-            notifier.info(ctxt.to_dict(), 'telemetry.api', published_samples)
+            notifier.sample(ctxt.to_dict(), 'telemetry.api',
+                            {'samples': published_samples})
 
         return samples
 
@@ -453,7 +454,7 @@ class Meter(base.Base):
         meter_id = '%s+%s' % (kwargs['resource_id'], kwargs['name'])
         # meter_id is of type Unicode but base64.encodestring() only accepts
         # strings. See bug #1333177
-        meter_id = base64.encodestring(meter_id.encode('utf-8'))
+        meter_id = base64.b64encode(meter_id.encode('utf-8'))
         kwargs['meter_id'] = meter_id
         super(Meter, self).__init__(**kwargs)
 
@@ -476,11 +477,12 @@ class MetersController(rest.RestController):
     def _lookup(self, meter_name, *remainder):
         return MeterController(meter_name), remainder
 
-    @wsme_pecan.wsexpose([Meter], [base.Query])
-    def get_all(self, q=None):
+    @wsme_pecan.wsexpose([Meter], [base.Query], int, str)
+    def get_all(self, q=None, limit=None, unique=''):
         """Return all known meters, based on the data recorded so far.
 
         :param q: Filter rules for the meters to be returned.
+        :param unique: flag to indicate unique meters to be returned.
         """
 
         rbac.enforce('get_meters', pecan.request)
@@ -488,7 +490,11 @@ class MetersController(rest.RestController):
         q = q or []
 
         # Timestamp field is not supported for Meter queries
+        limit = v2_utils.enforce_limit(limit)
         kwargs = v2_utils.query_to_kwargs(
-            q, pecan.request.storage_conn.get_meters, allow_timestamps=False)
+            q, pecan.request.storage_conn.get_meters,
+            ['limit'], allow_timestamps=False)
         return [Meter.from_db_model(m)
-                for m in pecan.request.storage_conn.get_meters(**kwargs)]
+                for m in pecan.request.storage_conn.get_meters(
+                limit=limit, unique=strutils.bool_from_string(unique),
+                **kwargs)]

@@ -8,15 +8,9 @@
     instance_id:
       fields: payload.instance_id
     host:
-      fields: publisher_id
-      plugin:
-        name: split
-        parameters:
-          segment: 1
-          max_split: 1
+      fields: publisher_id.`split(., 1, 1)`
     service:
-      fields: publisher_id
-      plugin: split
+      fields: publisher_id.`split(., 0, -1)`
     memory_mb:
       type: int
       fields: payload.memory_mb
@@ -96,6 +90,12 @@
       fields: payload.snapshot_id
     volume_id:
       fields: payload.volume_id
+- event_type: ['image_volume_cache.*']
+  traits:
+    image_id:
+      fields: payload.image_id
+    host:
+      fields: payload.host
 - event_type: ['image.update', 'image.upload', 'image.delete']
   traits: &glance_crud
     project_id:
@@ -144,6 +144,23 @@
       fields: _context_user_id
     resource_id:
       fields: payload.cluster_id
+- event_type: sahara.cluster.health
+  traits: &sahara_health
+    <<: *sahara_crud
+    verification_id:
+      fields: payload.verification_id
+    health_check_status:
+      fields: payload.health_check_status
+    health_check_name:
+      fields: payload.health_check_name
+    health_check_description:
+      fields: payload.health_check_description
+    created_at:
+      type: datetime
+      fields: payload.created_at
+    updated_at:
+      type: datetime
+      fields: payload.updated_at
 - event_type: ['identity.user.*', 'identity.project.*', 'identity.group.*', 'identity.role.*', 'identity.OS-TRUST:trust.*',
                'identity.region.*', 'identity.service.*', 'identity.endpoint.*', 'identity.policy.*']
   traits: &identity_crud
@@ -243,7 +260,7 @@
       fields: _context_user_id
     project_id:
       fields: _context_tenant
-- event_type: ['network.*', 'subnet.*', 'port.*', 'router.*', 'floatingip.*', 'pool.*', 'vip.*', 'member.*', 'health_monitor.*', 'firewall.*', 'firewall_policy.*', 'firewall_rule.*', 'vpnservice.*', 'ipsecpolicy.*', 'ikepolicy.*', 'ipsec_site_connection.*']
+- event_type: ['network.*', 'subnet.*', 'port.*', 'router.*', 'floatingip.*', 'pool.*', 'vip.*', 'member.*', 'health_monitor.*', 'healthmonitor.*', 'listener.*', 'loadbalancer.*', 'firewall.*', 'firewall_policy.*', 'firewall_rule.*', 'vpnservice.*', 'ipsecpolicy.*', 'ikepolicy.*', 'ipsec_site_connection.*']
   traits: &network_traits
     user_id:
       fields: _context_user_id
@@ -294,6 +311,21 @@
     <<: *network_traits
     resource_id:
       fields: ['payload.health_monitor.id', 'payload.id']
+- event_type: healthmonitor.*
+  traits:
+    <<: *network_traits
+    resource_id:
+      fields: ['payload.healthmonitor.id', 'payload.id']
+- event_type: listener.*
+  traits:
+    <<: *network_traits
+    resource_id:
+      fields: ['payload.listener.id', 'payload.id']
+- event_type: loadbalancer.*
+  traits:
+    <<: *network_traits
+    resource_id:
+      fields: ['payload.loadbalancer.id', 'payload.id']
 - event_type: firewall.*
   traits:
     <<: *network_traits
@@ -331,6 +363,10 @@
       fields: ['payload.ipsec_site_connection.id', 'payload.id']
 - event_type: '*http.*'
   traits: &http_audit
+    project_id:
+      fields: payload.initiator.project_id
+    user_id:
+      fields: payload.initiator.id
     typeURI:
       fields: payload.typeURI
     eventType:
@@ -396,6 +432,15 @@
       fields: parent_domain_id
     serial:
       fields: payload.serial
+- event_type: dns.domain.exists
+  traits:
+    <<: *dns_domain_traits
+    audit_period_beginning:
+      type: datetime
+      fields: payload.audit_period_beginning
+    audit_period_ending:
+      type: datetime
+      fields: payload.audit_period_ending
 - event_type: trove.*
   traits: &trove_base_traits
     state:
@@ -476,3 +521,33 @@
     audit_period_ending:
       type: datetime
       fields: payload.audit_period_ending
+- event_type: profiler.*
+  traits:
+    project:
+      fields: payload.project
+    service:
+      fields: payload.service
+    name:
+      fields: payload.name
+    base_id:
+      fields: payload.base_id
+    trace_id:
+      fields: payload.trace_id
+    parent_id:
+      fields: payload.parent_id
+    timestamp:
+      fields: payload.timestamp
+    host:
+      fields: payload.info.host
+    path:
+      fields: payload.info.request.path
+    query:
+      fields: payload.info.request.query
+    method:
+      fields: payload.info.request.method
+    scheme:
+      fields: payload.info.request.scheme
+    db.statement:
+      fields: payload.info.db.statement
+    db.params:
+      fields: payload.info.db.params

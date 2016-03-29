@@ -18,14 +18,15 @@ from oslo_utils import timeutils
 
 from ceilometer import dispatcher
 from ceilometer.event.storage import models
-from ceilometer.i18n import _, _LE, _LW
+from ceilometer.i18n import _LE, _LW
 from ceilometer.publisher import utils as publisher_utils
 from ceilometer import storage
 
 LOG = log.getLogger(__name__)
 
 
-class DatabaseDispatcher(dispatcher.Base):
+class DatabaseDispatcher(dispatcher.MeterDispatcherBase,
+                         dispatcher.EventDispatcherBase):
     """Dispatcher class for recording metering data into database.
 
     The dispatcher class which records each meter into a database configured
@@ -35,8 +36,10 @@ class DatabaseDispatcher(dispatcher.Base):
     ceilometer.conf file
 
     [DEFAULT]
-    dispatcher = database
+    meter_dispatchers = database
+    event_dispatchers = database
     """
+
     def __init__(self, conf):
         super(DatabaseDispatcher, self).__init__(conf)
 
@@ -73,13 +76,13 @@ class DatabaseDispatcher(dispatcher.Base):
             data = [data]
 
         for meter in data:
-            LOG.debug(_(
+            LOG.debug(
                 'metering data %(counter_name)s '
-                'for %(resource_id)s @ %(timestamp)s: %(counter_volume)s')
-                % ({'counter_name': meter['counter_name'],
-                    'resource_id': meter['resource_id'],
-                    'timestamp': meter.get('timestamp', 'NO TIMESTAMP'),
-                    'counter_volume': meter['counter_volume']}))
+                'for %(resource_id)s @ %(timestamp)s: %(counter_volume)s',
+                {'counter_name': meter['counter_name'],
+                 'resource_id': meter['resource_id'],
+                 'timestamp': meter.get('timestamp', 'NO TIMESTAMP'),
+                 'counter_volume': meter['counter_volume']})
             if publisher_utils.verify_signature(
                     meter, self.conf.publisher.telemetry_secret):
                 try:
@@ -106,20 +109,25 @@ class DatabaseDispatcher(dispatcher.Base):
 
         event_list = []
         for ev in events:
-            try:
-                event_list.append(
-                    models.Event(
-                        message_id=ev['message_id'],
-                        event_type=ev['event_type'],
-                        generated=timeutils.normalize_time(
-                            timeutils.parse_isotime(ev['generated'])),
-                        traits=[models.Trait(
-                                name, dtype,
-                                models.Trait.convert_value(dtype, value))
-                                for name, dtype, value in ev['traits']],
-                        raw=ev.get('raw', {}))
-                )
-            except Exception:
-                LOG.exception(_LE("Error processing event and it will be "
-                                  "dropped: %s"), ev)
+            if publisher_utils.verify_signature(
+                    ev, self.conf.publisher.telemetry_secret):
+                try:
+                    event_list.append(
+                        models.Event(
+                            message_id=ev['message_id'],
+                            event_type=ev['event_type'],
+                            generated=timeutils.normalize_time(
+                                timeutils.parse_isotime(ev['generated'])),
+                            traits=[models.Trait(
+                                    name, dtype,
+                                    models.Trait.convert_value(dtype, value))
+                                    for name, dtype, value in ev['traits']],
+                            raw=ev.get('raw', {}))
+                    )
+                except Exception:
+                    LOG.exception(_LE("Error processing event and it will be "
+                                      "dropped: %s"), ev)
+            else:
+                LOG.warning(_LW(
+                    'event signature invalid, discarding event: %s'), ev)
         self.event_conn.record_events(event_list)

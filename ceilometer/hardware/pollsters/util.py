@@ -41,22 +41,25 @@ def make_resource_metadata(res_metadata=None, host_url=None):
 
 def make_sample_from_host(host_url, name, sample_type, unit, volume,
                           project_id=None, user_id=None, resource_id=None,
-                          res_metadata=None, extra=None):
+                          res_metadata=None, extra=None,
+                          name_prefix='hardware'):
 
     extra = extra or {}
     resource_metadata = make_resource_metadata(res_metadata, host_url)
     resource_metadata.update(extra)
 
     res_id = resource_id or extra.get('resource_id') or host_url.hostname
+    if name_prefix:
+        name = name_prefix + '.' + name
     return sample.Sample(
-        name='hardware.' + name,
+        name=name,
         type=sample_type,
         unit=unit,
         volume=volume,
         user_id=user_id or extra.get('user_id'),
         project_id=project_id or extra.get('project_id'),
         resource_id=res_id,
-        timestamp=timeutils.isotime(),
+        timestamp=timeutils.utcnow().isoformat(),
         resource_metadata=resource_metadata,
         source='hardware',
     )

@@ -22,12 +22,9 @@ from paste import deploy
 import pecan
 from werkzeug import serving
 
-from ceilometer.api import config as api_config
 from ceilometer.api import hooks
 from ceilometer.api import middleware
-from ceilometer.i18n import _
-from ceilometer.i18n import _LW
-from ceilometer import service
+from ceilometer.i18n import _LI, _LW
 
 LOG = log.getLogger(__name__)
 
@@ -38,8 +35,6 @@ OPTS = [
                default="api_paste.ini",
                help="Configuration file for WSGI definition of API."
                ),
-    cfg.IntOpt('api_workers', default=1,
-               help='Number of workers for Ceilometer API server.'),
 ]
 
 API_OPTS = [
@@ -47,7 +42,8 @@ API_OPTS = [
                 default=False,
                 help='Toggle Pecan Debug Middleware.'),
     cfg.IntOpt('default_api_return_limit',
-               default=1000,
+               min=1,
+               default=100,
                help='Default maximum number of items returned by API request.'
                ),
 ]
@@ -56,60 +52,38 @@ CONF.register_opts(OPTS)
 CONF.register_opts(API_OPTS, group='api')
 
 
-def get_pecan_config():
-    # Set up the pecan configuration
-    filename = api_config.__file__.replace('.pyc', '.py')
-    return pecan.configuration.conf_from_file(filename)
-
-
-def setup_app(pecan_config=None, extra_hooks=None):
+def setup_app(pecan_config=None):
     # FIXME: Replace DBHook with a hooks.TransactionHook
     app_hooks = [hooks.ConfigHook(),
                  hooks.DBHook(),
                  hooks.NotifierHook(),
                  hooks.TranslationHook()]
-    if extra_hooks:
-        app_hooks.extend(extra_hooks)
 
-    if not pecan_config:
-        pecan_config = get_pecan_config()
+    pecan_config = pecan_config or {
+        "app": {
+            'root': 'ceilometer.api.controllers.root.RootController',
+            'modules': ['ceilometer.api'],
+        }
+    }
 
     pecan.configuration.set_config(dict(pecan_config), overwrite=True)
 
     # NOTE(sileht): pecan debug won't work in multi-process environment
     pecan_debug = CONF.api.pecan_debug
-    if service.get_workers('api') != 1 and pecan_debug:
+    if CONF.api.workers and CONF.api.workers != 1 and pecan_debug:
         pecan_debug = False
         LOG.warning(_LW('pecan_debug cannot be enabled, if workers is > 1, '
                         'the value is overrided with False'))
 
     app = pecan.make_app(
-        pecan_config.app.root,
+        pecan_config['app']['root'],
         debug=pecan_debug,
-        force_canonical=getattr(pecan_config.app, 'force_canonical', True),
         hooks=app_hooks,
         wrap_app=middleware.ParsableErrorMiddleware,
         guess_content_type_from_ext=False
     )
 
     return app
-
-
-class VersionSelectorApplication(object):
-    def __init__(self):
-        pc = get_pecan_config()
-
-        def not_found(environ, start_response):
-            start_response('404 Not Found', [])
-            return []
-
-        self.v1 = not_found
-        self.v2 = setup_app(pecan_config=pc)
-
-    def __call__(self, environ, start_response):
-        if environ['PATH_INFO'].startswith('/v1/'):
-            return self.v1(environ, start_response)
-        return self.v2(environ, start_response)
 
 
 def load_app():
@@ -132,22 +106,21 @@ def build_server():
     # Create the WSGI server and start it
     host, port = cfg.CONF.api.host, cfg.CONF.api.port
 
-    LOG.info(_('Starting server in PID %s') % os.getpid())
-    LOG.info(_("Configuration:"))
+    LOG.info(_LI('Starting server in PID %s') % os.getpid())
+    LOG.info(_LI("Configuration:"))
     cfg.CONF.log_opt_values(LOG, logging.INFO)
 
     if host == '0.0.0.0':
-        LOG.info(_(
+        LOG.info(_LI(
             'serving on 0.0.0.0:%(sport)s, view at http://127.0.0.1:%(vport)s')
             % ({'sport': port, 'vport': port}))
     else:
-        LOG.info(_("serving on http://%(host)s:%(port)s") % (
+        LOG.info(_LI("serving on http://%(host)s:%(port)s") % (
                  {'host': host, 'port': port}))
 
-    workers = service.get_workers('api')
     serving.run_simple(cfg.CONF.api.host, cfg.CONF.api.port,
-                       app, processes=workers)
+                       app, processes=CONF.api.workers)
 
 
 def app_factory(global_config, **local_conf):
-    return VersionSelectorApplication()
+    return setup_app()

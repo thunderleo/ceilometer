@@ -50,7 +50,7 @@ class Connection(base.Connection):
     )
 
     def get_meters(self, user=None, project=None, resource=None, source=None,
-                   metaquery=None):
+                   metaquery=None, limit=None, unique=False):
         """Return an iterable of models.Meter instances
 
         :param user: Optional ID for user that owns the resource.
@@ -58,34 +58,70 @@ class Connection(base.Connection):
         :param resource: Optional resource filter.
         :param source: Optional source filter.
         :param metaquery: Optional dict with metadata to match on.
+        :param limit: Maximum number of results to return.
+        :param unique: If set to true, return only unique meter information.
         """
+        if limit == 0:
+            return
 
         metaquery = pymongo_utils.improve_keys(metaquery, metaquery=True) or {}
 
         q = {}
-        if user is not None:
+        if user == 'None':
+            q['user_id'] = None
+        elif user is not None:
             q['user_id'] = user
-        if project is not None:
+        if project == 'None':
+            q['project_id'] = None
+        elif project is not None:
             q['project_id'] = project
-        if resource is not None:
+        if resource == 'None':
+            q['_id'] = None
+        elif resource is not None:
             q['_id'] = resource
         if source is not None:
             q['source'] = source
         q.update(metaquery)
 
+        count = 0
+        if unique:
+            meter_names = set()
+
         for r in self.db.resource.find(q):
             for r_meter in r['meter']:
-                yield models.Meter(
-                    name=r_meter['counter_name'],
-                    type=r_meter['counter_type'],
-                    # Return empty string if 'counter_unit' is not valid for
-                    # backward compatibility.
-                    unit=r_meter.get('counter_unit', ''),
-                    resource_id=r['_id'],
-                    project_id=r['project_id'],
-                    source=r['source'],
-                    user_id=r['user_id'],
-                )
+                if unique:
+                    if r_meter['counter_name'] in meter_names:
+                        continue
+                    else:
+                        meter_names.add(r_meter['counter_name'])
+
+                if limit and count >= limit:
+                    return
+                else:
+                    count += 1
+
+                if unique:
+                    yield models.Meter(
+                        name=r_meter['counter_name'],
+                        type=r_meter['counter_type'],
+                        # Return empty string if 'counter_unit' is not valid
+                        # for backward compatibility.
+                        unit=r_meter.get('counter_unit', ''),
+                        resource_id=None,
+                        project_id=None,
+                        source=None,
+                        user_id=None)
+                else:
+                    yield models.Meter(
+                        name=r_meter['counter_name'],
+                        type=r_meter['counter_type'],
+                        # Return empty string if 'counter_unit' is not valid
+                        # for backward compatibility.
+                        unit=r_meter.get('counter_unit', ''),
+                        resource_id=r['_id'],
+                        project_id=r['project_id'],
+                        source=r['source'],
+                        user_id=r['user_id'])
 
     def get_samples(self, sample_filter, limit=None):
         """Return an iterable of model.Sample instances.
@@ -131,6 +167,8 @@ class Connection(base.Connection):
             del s['_id']
             # Backward compatibility for samples without units
             s['counter_unit'] = s.get('counter_unit', '')
+            # Compatibility with MongoDB 3.+
+            s['counter_volume'] = float(s.get('counter_volume'))
             # Tolerate absence of recorded_at in older datapoints
             s['recorded_at'] = s.get('recorded_at')
             # Check samples for metadata and "unquote" key if initially it

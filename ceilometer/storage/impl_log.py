@@ -17,7 +17,7 @@
 
 from oslo_log import log
 
-from ceilometer.i18n import _
+from ceilometer.i18n import _LI
 from ceilometer.storage import base
 
 LOG = log.getLogger(__name__)
@@ -38,8 +38,8 @@ class Connection(base.Connection):
         :param data: a dictionary such as returned by
                      ceilometer.meter.meter_message_from_counter.
         """
-        LOG.info(_('metering data %(counter_name)s for %(resource_id)s: '
-                   '%(counter_volume)s')
+        LOG.info(_LI('metering data %(counter_name)s for %(resource_id)s: '
+                     '%(counter_volume)s')
                  % ({'counter_name': data['counter_name'],
                      'resource_id': data['resource_id'],
                      'counter_volume': data['counter_volume']}))
@@ -50,12 +50,12 @@ class Connection(base.Connection):
         Clearing occurs according to the time-to-live.
         :param ttl: Number of seconds to keep records for.
         """
-        LOG.info(_("Dropping metering data with TTL %d"), ttl)
+        LOG.info(_LI("Dropping metering data with TTL %d"), ttl)
 
     def get_resources(self, user=None, project=None, source=None,
                       start_timestamp=None, start_timestamp_op=None,
                       end_timestamp=None, end_timestamp_op=None,
-                      metaquery=None, resource=None):
+                      metaquery=None, resource=None, limit=None):
         """Return an iterable of dictionaries containing resource information.
 
         { 'resource_id': UUID of the resource,
@@ -75,11 +75,12 @@ class Connection(base.Connection):
         :param end_timestamp_op: Optional end time operator, like lt, le.
         :param metaquery: Optional dict with metadata to match on.
         :param resource: Optional resource filter.
+        :param limit: Maximum number of results to return.
         """
         return []
 
     def get_meters(self, user=None, project=None, resource=None, source=None,
-                   limit=None, metaquery=None):
+                   limit=None, metaquery=None, unique=False):
         """Return an iterable of dictionaries containing meter information.
 
         { 'name': name of the meter,
@@ -95,14 +96,15 @@ class Connection(base.Connection):
         :param source: Optional source filter.
         :param limit: Maximum number of results to return.
         :param metaquery: Optional dict with metadata to match on.
+        :param unique: If set to true, return only unique meter information.
         """
         return []
 
-    def get_samples(self, sample_filter):
+    def get_samples(self, sample_filter, limit=None):
         """Return an iterable of samples.
 
         Items are created by
-        :func:`ceilometer.meter.meter_message_from_counter`.
+        ceilometer.publisher.utils.meter_message_from_counter.
         """
         return []
 

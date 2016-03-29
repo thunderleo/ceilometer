@@ -14,14 +14,14 @@
 
 import datetime
 
-from keystoneclient import exceptions
+from keystoneauth1 import exceptions
 from oslo_config import cfg
 from oslo_log import log
 import requests
 import six
 
 from ceilometer.agent import plugin_base
-from ceilometer.i18n import _
+from ceilometer import keystone_client
 from ceilometer import sample
 
 
@@ -70,7 +70,7 @@ class _Base(plugin_base.PollsterBase):
     @staticmethod
     def get_kwapi_client(ksclient, endpoint):
         """Returns a KwapiClient configured with the proper url and token."""
-        return KwapiClient(endpoint, ksclient.auth_token)
+        return KwapiClient(endpoint, keystone_client.get_auth_token(ksclient))
 
     CACHE_KEY_PROBE = 'kwapi.probes'
 
@@ -85,7 +85,7 @@ class _Base(plugin_base.PollsterBase):
         try:
             client = self.get_kwapi_client(ksclient, endpoint)
         except exceptions.EndpointNotFound:
-            LOG.debug(_("Kwapi endpoint not found"))
+            LOG.debug("Kwapi endpoint not found")
             return []
         return list(client.iter_probes())
 

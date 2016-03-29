@@ -17,7 +17,7 @@
 
 from __future__ import absolute_import
 
-from keystoneclient import exceptions
+from keystoneauth1 import exceptions
 from oslo_config import cfg
 from oslo_log import log
 from oslo_utils import timeutils
@@ -25,7 +25,7 @@ import six.moves.urllib.parse as urlparse
 from swiftclient import client as swift
 
 from ceilometer.agent import plugin_base
-from ceilometer.i18n import _
+from ceilometer import keystone_client
 from ceilometer import sample
 
 
@@ -46,7 +46,7 @@ SERVICE_OPTS = [
 
 cfg.CONF.register_opts(OPTS)
 cfg.CONF.register_opts(SERVICE_OPTS, group='service_types')
-cfg.CONF.import_group('service_credentials', 'ceilometer.service')
+cfg.CONF.import_group('service_credentials', 'ceilometer.keystone_client')
 
 
 class _Base(plugin_base.PollsterBase):
@@ -69,11 +69,12 @@ class _Base(plugin_base.PollsterBase):
         if _Base._ENDPOINT is None:
             try:
                 conf = cfg.CONF.service_credentials
-                _Base._ENDPOINT = ksclient.service_catalog.url_for(
-                    service_type=cfg.CONF.service_types.swift,
-                    endpoint_type=conf.os_endpoint_type)
+                _Base._ENDPOINT = keystone_client.get_service_catalog(
+                    ksclient).url_for(
+                        service_type=cfg.CONF.service_types.swift,
+                        interface=conf.interface)
             except exceptions.EndpointNotFound:
-                LOG.debug(_("Swift endpoint not found"))
+                LOG.debug("Swift endpoint not found")
         return _Base._ENDPOINT
 
     def _iter_accounts(self, ksclient, cache, tenants):
@@ -91,7 +92,7 @@ class _Base(plugin_base.PollsterBase):
             api_method = '%s_account' % self.METHOD
             yield (t.id, getattr(swift, api_method)
                                 (self._neaten_url(endpoint, t.id),
-                                 ksclient.auth_token))
+                                 keystone_client.get_auth_token(ksclient)))
 
     @staticmethod
     def _neaten_url(endpoint, tenant_id):
@@ -114,7 +115,7 @@ class ObjectsPollster(_Base):
                 user_id=None,
                 project_id=tenant,
                 resource_id=tenant,
-                timestamp=timeutils.isotime(),
+                timestamp=timeutils.utcnow().isoformat(),
                 resource_metadata=None,
             )
 
@@ -133,7 +134,7 @@ class ObjectsSizePollster(_Base):
                 user_id=None,
                 project_id=tenant,
                 resource_id=tenant,
-                timestamp=timeutils.isotime(),
+                timestamp=timeutils.utcnow().isoformat(),
                 resource_metadata=None,
             )
 
@@ -152,7 +153,7 @@ class ObjectsContainersPollster(_Base):
                 user_id=None,
                 project_id=tenant,
                 resource_id=tenant,
-                timestamp=timeutils.isotime(),
+                timestamp=timeutils.utcnow().isoformat(),
                 resource_metadata=None,
             )
 
@@ -176,7 +177,7 @@ class ContainersObjectsPollster(_Base):
                     user_id=None,
                     project_id=tenant,
                     resource_id=tenant + '/' + container['name'],
-                    timestamp=timeutils.isotime(),
+                    timestamp=timeutils.utcnow().isoformat(),
                     resource_metadata=None,
                 )
 
@@ -200,6 +201,6 @@ class ContainersSizePollster(_Base):
                     user_id=None,
                     project_id=tenant,
                     resource_id=tenant + '/' + container['name'],
-                    timestamp=timeutils.isotime(),
+                    timestamp=timeutils.utcnow().isoformat(),
                     resource_metadata=None,
                 )

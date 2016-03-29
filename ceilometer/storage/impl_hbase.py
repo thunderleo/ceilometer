@@ -19,7 +19,6 @@ from oslo_log import log
 from oslo_utils import timeutils
 
 import ceilometer
-from ceilometer.i18n import _
 from ceilometer.storage import base
 from ceilometer.storage.hbase import base as hbase_base
 from ceilometer.storage.hbase import migration as hbase_migration
@@ -128,24 +127,24 @@ class Connection(hbase_base.Connection, base.Connection):
             hbase_migration.migrate_tables(conn, tables)
 
     def clear(self):
-        LOG.debug(_('Dropping HBase schema...'))
+        LOG.debug('Dropping HBase schema...')
         with self.conn_pool.connection() as conn:
             for table in [self.RESOURCE_TABLE,
                           self.METER_TABLE]:
                 try:
                     conn.disable_table(table)
                 except Exception:
-                    LOG.debug(_('Cannot disable table but ignoring error'))
+                    LOG.debug('Cannot disable table but ignoring error')
                 try:
                     conn.delete_table(table)
                 except Exception:
-                    LOG.debug(_('Cannot delete table but ignoring error'))
+                    LOG.debug('Cannot delete table but ignoring error')
 
     def record_metering_data(self, data):
         """Write the data to the backend storage system.
 
         :param data: a dictionary such as returned by
-          ceilometer.meter.meter_message_from_counter
+          ceilometer.publisher.utils.meter_message_from_counter
         """
         with self.conn_pool.connection() as conn:
             resource_table = conn.table(self.RESOURCE_TABLE)
@@ -186,7 +185,7 @@ class Connection(hbase_base.Connection, base.Connection):
     def get_resources(self, user=None, project=None, source=None,
                       start_timestamp=None, start_timestamp_op=None,
                       end_timestamp=None, end_timestamp_op=None,
-                      metaquery=None, resource=None):
+                      metaquery=None, resource=None, limit=None):
         """Return an iterable of models.Resource instances
 
         :param user: Optional ID for user that owns the resource.
@@ -198,7 +197,10 @@ class Connection(hbase_base.Connection, base.Connection):
         :param end_timestamp_op: Optional end time operator, like lt, le.
         :param metaquery: Optional dict with metadata to match on.
         :param resource: Optional resource filter.
+        :param limit: Maximum number of results to return.
         """
+        if limit == 0:
+            return
         q = hbase_utils.make_query(metaquery=metaquery, user_id=user,
                                    project_id=project,
                                    resource_id=resource, source=source)
@@ -209,9 +211,10 @@ class Connection(hbase_base.Connection, base.Connection):
                                                       source, q)
         with self.conn_pool.connection() as conn:
             resource_table = conn.table(self.RESOURCE_TABLE)
-            LOG.debug(_("Query Resource table: %s") % q)
-            for resource_id, data in resource_table.scan(filter=q):
-                f_res, sources, meters, md = hbase_utils.deserialize_entry(
+            LOG.debug("Query Resource table: %s", q)
+            for resource_id, data in resource_table.scan(filter=q,
+                                                         limit=limit):
+                f_res, meters, md = hbase_utils.deserialize_entry(
                     data)
                 resource_id = hbase_utils.encode_unicode(resource_id)
                 # Unfortunately happybase doesn't keep ordered result from
@@ -220,14 +223,14 @@ class Connection(hbase_base.Connection, base.Connection):
                 first_ts = min(meters, key=operator.itemgetter(1))[1]
                 last_ts = max(meters, key=operator.itemgetter(1))[1]
                 source = meters[0][0][1]
-                # If we use QualifierFilter then HBase returnes only
+                # If we use QualifierFilter then HBase returns only
                 # qualifiers filtered by. It will not return the whole entry.
                 # That's why if we need to ask additional qualifiers manually.
                 if 'project_id' not in f_res and 'user_id' not in f_res:
                     row = resource_table.row(
                         resource_id, columns=['f:project_id', 'f:user_id',
                                               'f:resource_metadata'])
-                    f_res, _s, _m, md = hbase_utils.deserialize_entry(row)
+                    f_res, _m, md = hbase_utils.deserialize_entry(row)
                 yield models.Resource(
                     resource_id=resource_id,
                     first_sample_timestamp=first_ts,
@@ -238,7 +241,7 @@ class Connection(hbase_base.Connection, base.Connection):
                     metadata=md)
 
     def get_meters(self, user=None, project=None, resource=None, source=None,
-                   metaquery=None):
+                   metaquery=None, limit=None, unique=False):
         """Return an iterable of models.Meter instances
 
         :param user: Optional ID for user that owns the resource.
@@ -246,7 +249,11 @@ class Connection(hbase_base.Connection, base.Connection):
         :param resource: Optional resource filter.
         :param source: Optional source filter.
         :param metaquery: Optional dict with metadata to match on.
+        :param limit: Maximum number of results to return.
+        :param unique: If set to true, return only unique meter information.
         """
+        if limit == 0:
+            return
 
         metaquery = metaquery or {}
 
@@ -256,7 +263,7 @@ class Connection(hbase_base.Connection, base.Connection):
                                        project_id=project,
                                        resource_id=resource,
                                        source=source)
-            LOG.debug(_("Query Resource table: %s") % q)
+            LOG.debug("Query Resource table: %s", q)
 
             gen = resource_table.scan(filter=q)
             # We need result set to be sure that user doesn't receive several
@@ -264,22 +271,38 @@ class Connection(hbase_base.Connection, base.Connection):
             # https://bugs.launchpad.net/ceilometer/+bug/1301371
             result = set()
             for ignored, data in gen:
-                flatten_result, s, meters, md = hbase_utils.deserialize_entry(
+                flatten_result, meters, md = hbase_utils.deserialize_entry(
                     data)
                 for m in meters:
+                    if limit and len(result) >= limit:
+                        return
                     _m_rts, m_source, name, m_type, unit = m[0]
-                    meter_dict = {'name': name,
-                                  'type': m_type,
-                                  'unit': unit,
-                                  'resource_id': flatten_result['resource_id'],
-                                  'project_id': flatten_result['project_id'],
-                                  'user_id': flatten_result['user_id']}
+                    if unique:
+                        meter_dict = {'name': name,
+                                      'type': m_type,
+                                      'unit': unit,
+                                      'resource_id': None,
+                                      'project_id': None,
+                                      'user_id': None,
+                                      'source': None}
+                    else:
+                        meter_dict = {'name': name,
+                                      'type': m_type,
+                                      'unit': unit,
+                                      'resource_id':
+                                          flatten_result['resource_id'],
+                                      'project_id':
+                                          flatten_result['project_id'],
+                                      'user_id':
+                                          flatten_result['user_id']}
+
                     frozen_meter = frozenset(meter_dict.items())
                     if frozen_meter in result:
                         continue
                     result.add(frozen_meter)
-                    meter_dict.update({'source': m_source
-                                       if m_source else None})
+                    if not unique:
+                        meter_dict.update({'source': m_source
+                                           if m_source else None})
 
                     yield models.Meter(**meter_dict)
 
@@ -296,11 +319,13 @@ class Connection(hbase_base.Connection, base.Connection):
             q, start, stop, columns = (hbase_utils.
                                        make_sample_query_from_filter
                                        (sample_filter, require_meter=False))
-            LOG.debug(_("Query Meter Table: %s") % q)
+            LOG.debug("Query Meter Table: %s", q)
             gen = meter_table.scan(filter=q, row_start=start, row_stop=stop,
                                    limit=limit, columns=columns)
             for ignored, meter in gen:
                 d_meter = hbase_utils.deserialize_entry(meter)[0]
+                d_meter['message']['counter_volume'] = (
+                    float(d_meter['message']['counter_volume']))
                 d_meter['message']['recorded_at'] = d_meter['recorded_at']
                 yield models.Sample(**d_meter['message'])
 

@@ -49,12 +49,11 @@ def iter_period(start, end, period):
 def _handle_sort_key(model_name, sort_key=None):
     """Generate sort keys according to the passed in sort key from user.
 
-    :param model_name: Database model name be query.(alarm, meter, etc.)
+    :param model_name: Database model name be query.(meter, etc.)
     :param sort_key: sort key passed from user.
     return: sort keys list
     """
-    sort_keys_extra = {'alarm': ['name', 'user_id', 'project_id'],
-                       'meter': ['user_id', 'project_id'],
+    sort_keys_extra = {'meter': ['user_id', 'project_id'],
                        'resource': ['user_id', 'project_id', 'timestamp'],
                        }
 
@@ -154,7 +153,7 @@ class Connection(object):
         """Write the data to the backend storage system.
 
         :param data: a dictionary such as returned by
-                     ceilometer.meter.meter_message_from_counter
+                     ceilometer.publisher.utils.meter_message_from_counter
 
         All timestamps must be naive utc datetime object.
         """
@@ -176,7 +175,7 @@ class Connection(object):
     def get_resources(user=None, project=None, source=None,
                       start_timestamp=None, start_timestamp_op=None,
                       end_timestamp=None, end_timestamp_op=None,
-                      metaquery=None, resource=None):
+                      metaquery=None, resource=None, limit=None):
         """Return an iterable of models.Resource instances.
 
         Iterable items containing resource information.
@@ -189,12 +188,13 @@ class Connection(object):
         :param end_timestamp_op: Optional timestamp end range operation.
         :param metaquery: Optional dict with metadata to match on.
         :param resource: Optional resource filter.
+        :param limit: Maximum number of results to return.
         """
         raise ceilometer.NotImplementedError('Resources not implemented')
 
     @staticmethod
     def get_meters(user=None, project=None, resource=None, source=None,
-                   metaquery=None):
+                   metaquery=None, limit=None, unique=False):
         """Return an iterable of model.Meter instances.
 
         Iterable items containing meter information.
@@ -203,6 +203,8 @@ class Connection(object):
         :param resource: Optional resource filter.
         :param source: Optional source filter.
         :param metaquery: Optional dict with metadata to match on.
+        :param limit: Maximum number of results to return.
+        :param unique: If set to true, return only unique meter information.
         """
         raise ceilometer.NotImplementedError('Meters not implemented')
 
